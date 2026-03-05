@@ -1486,14 +1486,10 @@ function generateDFDXml(resources, modules, connections) {
 
     const tm = TIERS[t]||{label:t, bg:"#F5F5F5", border:"#999", hdr:"#555"};
     const tcid=`tier_${t}`;
-    // Use plain rectangle (NOT swimlane) — Lucidchart's draw.io importer doesn't render
-    // swimlane containers reliably; plain rectangles import correctly every time.
-    // Header label bar drawn as a separate filled rect on top of the tier body.
+    // Single plain rectangle per tier — most compatible with Lucidchart's draw.io importer.
+    // Label floats at top-left of the tier background box.
     containers.push(
-      `<mxCell id="${tcid}_body" value="" style="rounded=1;arcSize=2;fillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;html=0;" vertex="1" parent="1">\n          <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${tH}" as="geometry"/>\n        </mxCell>`
-    );
-    containers.push(
-      `<mxCell id="${tcid}" value="${xe(tm.label)} (${nodes.length})" style="rounded=1;arcSize=2;fillColor=${tm.hdr};strokeColor=${tm.border};strokeWidth=2;fontColor=#FFFFFF;fontSize=11;fontStyle=1;align=left;verticalAlign=middle;spacingLeft=10;html=0;" vertex="1" parent="1">\n          <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${HDRH}" as="geometry"/>\n        </mxCell>`
+      `<mxCell id="${tcid}" value="${xe(tm.label)} (${nodes.length})" style="rounded=1;fillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;fontColor=${tm.hdr};fontSize=11;fontStyle=1;align=left;verticalAlign=top;spacingLeft=10;spacingTop=5;" vertex="1" parent="1">\n          <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${tH}" as="geometry"/>\n        </mxCell>`
     );
 
     nodes.forEach((n,i)=>{
@@ -1508,12 +1504,14 @@ function generateDFDXml(resources, modules, connections) {
         : (n.type||"").replace(/^aws_|^xsphere_/,"").replace(/_/g," ").substring(0,20);
       const rawMulti = n.multi ? ` [${n.multi}]` : "";
       const rawName = (n.label||n.name||"").substring(0,18) + rawMulti;
-      // Plain text only — no HTML tags — ensures Lucidchart draw.io importer works correctly.
-      // Newline in value renders as two lines in draw.io and Lucidchart.
-      const rawLbl = shortType ? `${rawName}&#xa;${shortType}` : rawName;
+      // Use plain ASCII separator — avoids ALL XML entity encoding issues.
+      // &#xa; was being double-escaped by xe() → &amp;#xa; → showing literally as "&#xa;" in Lucidchart.
+      const rawLbl = shortType ? `${rawName} / ${shortType}` : rawName;
       const bdrDash = n._isModule||n.srcType==="remote_state" ? "dashed=1;" : "";
       const bgColor = n._isModule ? "#FAFFF5" : "#FFFFFF";
-      const style=`rounded=1;arcSize=8;fillColor=${bgColor};strokeColor=${meta.c||"#546E7A"};strokeWidth=1.5;fontColor=#333;fontSize=9;html=0;align=center;whiteSpace=wrap;verticalAlign=middle;${bdrDash}`;
+      // Minimal style — only fillColor, strokeColor, fontColor, fontSize, align.
+      // Removed: arcSize, whiteSpace, verticalAlign, html — fewer properties = fewer Lucidchart parse failures.
+      const style=`rounded=1;fillColor=${bgColor};strokeColor=${meta.c||"#546E7A"};strokeWidth=1;fontColor=#333333;fontSize=9;align=center;${bdrDash}`;
       vertices.push(
         `<mxCell id="${cid}" value="${xe(rawLbl)}" style="${style}" vertex="1" parent="1">\n          <mxGeometry x="${nx}" y="${ny}" width="${NW}" height="${NH+LH}" as="geometry"/>\n        </mxCell>`
       );
@@ -1535,22 +1533,13 @@ function generateDFDXml(resources, modules, connections) {
     if(seenE.has(ek))return;
     seenE.add(ek);
     const color=c.kind==="explicit"?"#E53935":c.kind==="module-input"?"#2E7D32":"#78909C";
-    const dash=c.kind==="explicit"?"dashed=1;dashPattern=6 3;":"";
+    const dash=c.kind==="explicit"?"dashed=1;" : "";
     const lbl=c.kind==="explicit"?"depends_on":c.kind==="module-input"?"input":"";
-    // Smart routing: tiers are vertical bands; route edges along tier boundaries
-    let routing;
-    if (sInfo.tier === tInfo.tier) {
-      // Same tier: side-to-side to avoid overlapping with cross-tier arrows
-      routing = "exitX=1;exitY=0.5;exitPerimeter=0;entryX=0;entryY=0.5;entryPerimeter=0;";
-    } else if (sInfo.tierIdx < tInfo.tierIdx) {
-      // Downward flow (higher → lower in stack): exit bottom, enter top
-      routing = "exitX=0.5;exitY=1;exitPerimeter=0;entryX=0.5;entryY=0;entryPerimeter=0;";
-    } else {
-      // Upward flow (lower → higher): exit top, enter bottom
-      routing = "exitX=0.5;exitY=0;exitPerimeter=0;entryX=0.5;entryY=1;entryPerimeter=0;";
-    }
+    // Minimal edge style — no routing hints, no Lucidchart-incompatible properties.
+    // exitX/exitY/entryX/entryY are draw.io-specific routing anchors that Lucidchart ignores
+    // or mishandles; removing them lets Lucidchart auto-route cleanly.
     edges.push(
-      `<mxCell id="e_${++cellN}" value="${lbl}" style="edgeStyle=orthogonalEdgeStyle;html=0;rounded=1;strokeColor=${color};strokeWidth=1.5;${dash}endArrow=block;endFill=1;fontSize=8;fontColor=${color};${routing}jettySize=8;orthogonalLoop=1;" edge="1" source="${sInfo.cid}" target="${tInfo.cid}" parent="1">\n          <mxGeometry relative="1" as="geometry"/>\n        </mxCell>`
+      `<mxCell id="e_${++cellN}" value="${lbl}" style="endArrow=block;endFill=1;strokeColor=${color};strokeWidth=1.5;${dash}fontColor=${color};fontSize=8;" edge="1" source="${sInfo.cid}" target="${tInfo.cid}" parent="1">\n          <mxGeometry relative="1" as="geometry"/>\n        </mxCell>`
     );
   });
 
@@ -1559,7 +1548,9 @@ function generateDFDXml(resources, modules, connections) {
   // Return bare <mxGraphModel> — wrapped in <mxfile compressed="false"> when downloading/copying.
   // Lucidchart requires the full <mxfile> wrapper with compressed="false"; file upload only (no paste-XML dialog).
   return [
-    `<mxGraphModel dx="1800" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="${Math.max(1654,totalW+LEGEND_W+100)}" pageHeight="${Math.max(1169,totalH+100)}" math="0" shadow="0">`,
+    // Minimal mxGraphModel — only pageWidth/pageHeight needed; all other attributes are draw.io UI hints
+    // that Lucidchart either ignores or may trip over.
+    `<mxGraphModel pageWidth="${Math.max(1654,totalW+LEGEND_W+100)}" pageHeight="${Math.max(1169,totalH+100)}">`,
     `  <root>`,
     `    <mxCell id="0"/>`,
     `    <mxCell id="1" parent="0"/>`,
@@ -4083,13 +4074,16 @@ export default function App() {
   }, []);
 
   const handleDrop = useCallback(e=>{ e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files, true); }, [readFiles]);
-  // Wrap in <mxfile> for .drawio download (draw.io app double-click open)
+  // Minimal <mxfile> wrapper — only compressed="false" is required.
+  // Removing host/modified/type/version avoids Lucidchart importer version-check failures.
   const drawioXml = xml
-    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="app.diagrams.net" modified="${new Date().toISOString()}" type="device" version="14.6.13" compressed="false">\n  <diagram id="tf-dfd" name="Enterprise Terraform DFD">\n${xml}\n  </diagram>\n</mxfile>`
+    ? `<?xml version="1.0" encoding="UTF-8"?>\n<mxfile compressed="false">\n  <diagram name="Enterprise Terraform DFD">\n${xml}\n  </diagram>\n</mxfile>`
     : "";
+  // Download as .xml — Lucidchart enterprise lists "Draw.io (.xml, .drawio)" and .xml
+  // extension passes more corporate DLP/firewall policies than .drawio.
   const download = () => {
     const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([drawioXml],{type:"application/xml"}));
-    a.download="enterprise-tf-dfd.drawio"; a.click();
+    a.download="enterprise-tf-dfd.xml"; a.click();
   };
   const copy = () => {
     // Copy the full mxfile XML (including <mxfile> wrapper) so users can save as .drawio and upload to Lucidchart
@@ -4211,7 +4205,7 @@ export default function App() {
               display:"flex", alignItems:"center", gap:6,
               fontWeight:700,
             }}>
-              ⬇ Export .drawio
+              ⬇ Export .xml
             </button>
             {/* SECONDARY: Copy XML */}
             <button onClick={copy} style={{
@@ -4725,9 +4719,9 @@ export default function App() {
                     {
                       name:"Lucidchart (Enterprise)", color:"#FF7043", badge:"✦ Primary — Draw.io Import",
                       steps:[
-                        "Click ⬇ Export .drawio in the top-right — saves enterprise-tf-dfd.drawio to your machine",
+                        "Click ⬇ Export .xml in the top-right — saves enterprise-tf-dfd.xml to your machine",
                         "In Lucidchart: click File → Import Documents",
-                        "In the Import dialog select Draw.io (.xml, .drawio) and upload your enterprise-tf-dfd.drawio file",
+                        "In the Import dialog select Draw.io (.xml, .drawio) and upload your enterprise-tf-dfd.xml file",
                         "All tier boundaries, resource nodes, and connection arrows will import correctly",
                         "Press Ctrl+Shift+H (Fit Page) after import to center the diagram in the canvas",
                       ]
@@ -4735,7 +4729,7 @@ export default function App() {
                     {
                       name:"draw.io / diagrams.net", color:"#1E88E5", badge:"Secondary",
                       steps:[
-                        "Click ⬇ Export .drawio to save the file",
+                        "Click ⬇ Export .xml to save the file",
                         "Open app.diagrams.net in any browser (free, no account needed)",
                         "Drag and drop the .drawio file onto the canvas — or use File → Import From → Device",
                         "All tier blocks, nodes, and connection arrows are preserved automatically",
@@ -4745,7 +4739,7 @@ export default function App() {
                     {
                       name:"Microsoft Visio", color:"#2E7D32", badge:null,
                       steps:[
-                        "Download the .drawio file via the ⬇ Export .drawio button",
+                        "Download the .xml file via the ⬇ Export .xml button",
                         "In draw.io, use File → Export As → Visio (.vsdx) to convert",
                         "Or install the Diagrams.net add-in for Visio from the Microsoft AppSource store",
                       ]
