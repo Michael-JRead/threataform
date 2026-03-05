@@ -1486,8 +1486,14 @@ function generateDFDXml(resources, modules, connections) {
 
     const tm = TIERS[t]||{label:t, bg:"#F5F5F5", border:"#999", hdr:"#555"};
     const tcid=`tier_${t}`;
+    // Use plain rectangle (NOT swimlane) — Lucidchart's draw.io importer doesn't render
+    // swimlane containers reliably; plain rectangles import correctly every time.
+    // Header label bar drawn as a separate filled rect on top of the tier body.
     containers.push(
-      `<mxCell id="${tcid}" value="${xe(tm.label)} (${nodes.length})" style="swimlane;startSize=${HDRH};fillColor=${tm.hdr};swimlaneFillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;fontColor=#FFFFFF;fontSize=12;fontStyle=1;align=left;swimlaneLine=1;rounded=1;arcSize=2;whiteSpace=wrap;html=1;" vertex="1" parent="1">\n          <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${tH}" as="geometry"/>\n        </mxCell>`
+      `<mxCell id="${tcid}_body" value="" style="rounded=1;arcSize=2;fillColor=${tm.bg};strokeColor=${tm.border};strokeWidth=2;html=0;" vertex="1" parent="1">\n          <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${tH}" as="geometry"/>\n        </mxCell>`
+    );
+    containers.push(
+      `<mxCell id="${tcid}" value="${xe(tm.label)} (${nodes.length})" style="rounded=1;arcSize=2;fillColor=${tm.hdr};strokeColor=${tm.border};strokeWidth=2;fontColor=#FFFFFF;fontSize=11;fontStyle=1;align=left;verticalAlign=middle;spacingLeft=10;html=0;" vertex="1" parent="1">\n          <mxGeometry x="${CPAD}" y="${globalY}" width="${tierW}" height="${HDRH}" as="geometry"/>\n        </mxCell>`
     );
 
     nodes.forEach((n,i)=>{
@@ -1502,10 +1508,12 @@ function generateDFDXml(resources, modules, connections) {
         : (n.type||"").replace(/^aws_|^xsphere_/,"").replace(/_/g," ").substring(0,20);
       const rawMulti = n.multi ? ` [${n.multi}]` : "";
       const rawName = (n.label||n.name||"").substring(0,18) + rawMulti;
-      const rawLbl = `<b style="font-size:9px">${rawName}</b><br/><span style="font-size:7px;color:#888">${shortType}</span>`;
+      // Plain text only — no HTML tags — ensures Lucidchart draw.io importer works correctly.
+      // Newline in value renders as two lines in draw.io and Lucidchart.
+      const rawLbl = shortType ? `${rawName}&#xa;${shortType}` : rawName;
       const bdrDash = n._isModule||n.srcType==="remote_state" ? "dashed=1;" : "";
       const bgColor = n._isModule ? "#FAFFF5" : "#FFFFFF";
-      const style=`rounded=1;arcSize=8;fillColor=${bgColor};strokeColor=${meta.c||"#546E7A"};strokeWidth=1.5;fontColor=#333;fontSize=10;html=1;align=center;whiteSpace=wrap;verticalAlign=top;${bdrDash}`;
+      const style=`rounded=1;arcSize=8;fillColor=${bgColor};strokeColor=${meta.c||"#546E7A"};strokeWidth=1.5;fontColor=#333;fontSize=9;html=0;align=center;whiteSpace=wrap;verticalAlign=middle;${bdrDash}`;
       vertices.push(
         `<mxCell id="${cid}" value="${xe(rawLbl)}" style="${style}" vertex="1" parent="1">\n          <mxGeometry x="${nx}" y="${ny}" width="${NW}" height="${NH+LH}" as="geometry"/>\n        </mxCell>`
       );
@@ -1542,7 +1550,7 @@ function generateDFDXml(resources, modules, connections) {
       routing = "exitX=0.5;exitY=0;exitPerimeter=0;entryX=0.5;entryY=1;entryPerimeter=0;";
     }
     edges.push(
-      `<mxCell id="e_${++cellN}" value="${lbl}" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=${color};strokeWidth=1.5;${dash}endArrow=block;endFill=1;fontSize=8;fontColor=${color};${routing}jettySize=8;orthogonalLoop=1;" edge="1" source="${sInfo.cid}" target="${tInfo.cid}" parent="1">\n          <mxGeometry relative="1" as="geometry"/>\n        </mxCell>`
+      `<mxCell id="e_${++cellN}" value="${lbl}" style="edgeStyle=orthogonalEdgeStyle;html=0;rounded=1;strokeColor=${color};strokeWidth=1.5;${dash}endArrow=block;endFill=1;fontSize=8;fontColor=${color};${routing}jettySize=8;orthogonalLoop=1;" edge="1" source="${sInfo.cid}" target="${tInfo.cid}" parent="1">\n          <mxGeometry relative="1" as="geometry"/>\n        </mxCell>`
     );
   });
 
@@ -4194,19 +4202,18 @@ export default function App() {
         {/* Action buttons */}
         {xml && (
           <div style={{marginLeft:"auto", display:"flex", gap:8, alignItems:"center"}}>
-            {/* PRIMARY: Lucidchart native format */}
-            <button onClick={downloadLucid} style={{
-              background:"linear-gradient(135deg,#FF9900,#FF6B35)",
-              border:"none",
+            {/* PRIMARY: draw.io / Lucidchart — confirmed supported format in enterprise Lucidchart */}
+            <button onClick={download} style={{
+              background:"linear-gradient(135deg,#FF6B3520,#FF990020)",
+              border:`1px solid ${C.accent}55`,
               borderRadius:7, padding:"7px 18px",
-              color:"#000", fontSize:12, cursor:"pointer", ...SANS,
+              color:C.accent, fontSize:12, cursor:"pointer", ...SANS,
               display:"flex", alignItems:"center", gap:6,
               fontWeight:700,
-              boxShadow:"0 2px 10px #FF990044",
             }}>
-              ⬇ Export .lucid
+              ⬇ Export .drawio
             </button>
-            {/* SECONDARY: Copy draw.io XML */}
+            {/* SECONDARY: Copy XML */}
             <button onClick={copy} style={{
               background: copied ? "#0D2010" : C.surface2,
               border:`1px solid ${copied ? C.green+"66" : C.border2}`,
@@ -4218,15 +4225,15 @@ export default function App() {
             }}>
               {copied ? "✓" : "⎘"} {copied ? "Copied!" : "Copy XML"}
             </button>
-            {/* SECONDARY: draw.io download */}
-            <button onClick={download} style={{
+            {/* TERTIARY: .lucid — for Lucidchart versions that support Lucid Standard Import */}
+            <button onClick={downloadLucid} title="Lucid Standard Import format (.lucid) — supported in some Lucidchart versions" style={{
               background:C.surface2,
               border:`1px solid ${C.border2}`,
               borderRadius:7, padding:"7px 13px",
               color:C.textMuted, fontSize:12, cursor:"pointer", ...SANS,
               display:"flex", alignItems:"center", gap:5,
             }}>
-              ⬇ .drawio
+              ⬇ .lucid
             </button>
           </div>
         )}
@@ -4716,29 +4723,29 @@ export default function App() {
                 <div style={{display:"flex", flexDirection:"column", gap:14, marginBottom:28}}>
                   {[
                     {
-                      name:"Lucidchart", color:"#FF7043", badge:"✦ Primary — Native Format",
+                      name:"Lucidchart (Enterprise)", color:"#FF7043", badge:"✦ Primary — Draw.io Import",
                       steps:[
-                        "Click ⬇ Export .lucid in the top-right — this downloads enterprise-tf-dfd.lucid (Lucid Standard Import format)",
-                        "In Lucidchart: click File → Import → Lucid Standard Import (or just drag the .lucid file onto the canvas)",
-                        "Select the downloaded enterprise-tf-dfd.lucid file and click Import — all tiers, nodes, and arrows import reliably",
-                        "If the menu option says 'Other' or similar, look for a file picker; upload the .lucid file directly",
-                        "Fallback only: click ⬇ .drawio → File → Import → Diagrams.net → upload the .drawio file (results may vary)",
+                        "Click ⬇ Export .drawio in the top-right — saves enterprise-tf-dfd.drawio to your machine",
+                        "In Lucidchart: click File → Import Documents",
+                        "In the Import dialog select Draw.io (.xml, .drawio) and upload your enterprise-tf-dfd.drawio file",
+                        "All tier boundaries, resource nodes, and connection arrows will import correctly",
+                        "Press Ctrl+Shift+H (Fit Page) after import to center the diagram in the canvas",
                       ]
                     },
                     {
                       name:"draw.io / diagrams.net", color:"#1E88E5", badge:"Secondary",
                       steps:[
-                        "Click the ⬇ .drawio button in the top-right to save your .drawio file",
+                        "Click ⬇ Export .drawio to save the file",
                         "Open app.diagrams.net in any browser (free, no account needed)",
                         "Drag and drop the .drawio file onto the canvas — or use File → Import From → Device",
-                        "All tier swim lanes, nodes, and connection arrows are preserved automatically",
+                        "All tier blocks, nodes, and connection arrows are preserved automatically",
                         "Press Ctrl+Shift+H (Cmd+Shift+H on Mac) to fit the diagram to the window",
                       ]
                     },
                     {
                       name:"Microsoft Visio", color:"#2E7D32", badge:null,
                       steps:[
-                        "Download the .drawio file via the ⬇ .drawio button",
+                        "Download the .drawio file via the ⬇ Export .drawio button",
                         "In draw.io, use File → Export As → Visio (.vsdx) to convert",
                         "Or install the Diagrams.net add-in for Visio from the Microsoft AppSource store",
                       ]
