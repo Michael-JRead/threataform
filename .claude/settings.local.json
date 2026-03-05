@@ -18,7 +18,14 @@
       "Bash(npx --yes acorn --ecma2020 --module terraform-enterprise-intelligence.jsx)",
       "Bash(npx vite build)",
       "WebFetch(domain:developer.lucid.co)",
-      "Bash(npm install lucide-react --save)"
+      "Bash(npm install lucide-react --save)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(npm install @mlc-ai/web-llm @huggingface/transformers)",
+      "Bash(npm run build)",
+      "Bash(git stash)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:webllm.mlc.ai)",
+      "WebFetch(domain:llm.mlc.ai)"
     ]
   }
 }

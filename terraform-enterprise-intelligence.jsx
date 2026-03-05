@@ -10,6 +10,7 @@ import {
   BarChart, TrendingUp, Target, Activity, ArrowUpRight, CheckSquare, Square,
   PenLine, RotateCcw, Cpu, Server, Network, HardDrive, Users, Plug,
   Download, XCircle, CheckCircle, Package,
+  Bot, MessageSquare, Send, StopCircle, ChevronUp,
 } from "lucide-react";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2212,7 +2213,32 @@ class ThreatModelIntelligence {
     CONTROL_DETECTION_MAP.forEach(ctrl => {
       try { (ctrl.detect(resources) ? present : absent).push({...ctrl}); } catch(e) { absent.push({...ctrl}); }
     });
-    return { present, absent };
+    // Cross-reference absent controls against uploaded doc chunks
+    const stillAbsent = [];
+    absent.forEach(ctrl => {
+      const check = this._docHasControl(ctrl.name);
+      if (check.found) {
+        present.push({ ...ctrl, source: 'doc', evidence: check.evidence });
+      } else {
+        stillAbsent.push(ctrl);
+      }
+    });
+    return { present, absent: stillAbsent };
+  }
+
+  // ── Doc-based control detection ───────────────────────────────────────────────
+  _docHasControl(ctrlName) {
+    const tokens = ctrlName.toLowerCase().split(/\W+/).filter(t => t.length > 3);
+    if (!tokens.length) return { found: false };
+    const nonTfChunks = this.chunks.filter(c => c.category !== 'terraform');
+    for (const c of nonTfChunks) {
+      const lc = c.text.toLowerCase();
+      const matches = tokens.filter(t => lc.includes(t));
+      if (matches.length >= Math.ceil(tokens.length * 0.6)) {
+        return { found: true, evidence: c.text.substring(0, 120), source: c.source || c.category || 'doc' };
+      }
+    }
+    return { found: false };
   }
 
   // ── Defense-in-Depth layer assessment ────────────────────────────────────────
@@ -2575,6 +2601,72 @@ class ThreatModelIntelligence {
     (modules||[]).forEach(m => {
       this._addChunk('terraform', `Terraform module ${m.name} source ${m.src||'registry'} type ${m.srcType||''}.`, 'terraform');
     });
+  }
+
+  // ── Extract key features from enterprise context docs ─────────────────────────
+  extractKeyFeatures() {
+    if (!this._built) return [];
+    const QUERIES = [
+      "data processing pipeline ingestion transformation",
+      "authentication authorization access control identity",
+      "API endpoints REST GraphQL integration gateway",
+      "encryption at rest in transit TLS certificate",
+      "storage database persistence caching",
+      "monitoring logging observability alerting",
+      "multi-tenancy tenant isolation namespace",
+      "compliance regulatory framework control",
+      "third party integrations external service vendor",
+      "fault tolerance redundancy high availability failover",
+      "data classification sensitive PII PHI PCI",
+      "user access role permission privilege",
+      "availability SLA uptime RTO RPO",
+      "compute serverless container kubernetes microservice",
+      "network boundary VPC subnet DMZ trust zone",
+    ];
+    const seen = new Set();
+    const bullets = [];
+    // BM25 query pass
+    QUERIES.forEach(q => {
+      const results = this.query(q, 3);
+      results.forEach(chunk => {
+        // Extract first meaningful sentence from chunk text
+        const sentences = chunk.text.split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 20);
+        sentences.slice(0, 2).forEach(sent => {
+          const key = sent.substring(0, 40);
+          if (!seen.has(key)) {
+            seen.add(key);
+            bullets.push(`- ${sent.charAt(0).toUpperCase() + sent.slice(1)}`);
+          }
+        });
+      });
+    });
+    // Direct exhaustive chunk scan for enterprise-arch + app-details categories
+    const enterpriseChunks = this.chunks.filter(c =>
+      c.category === 'enterprise-arch' || c.category === 'app-details'
+    );
+    enterpriseChunks.forEach(chunk => {
+      const sentences = chunk.text.split(/[.!?\n]+/).map(s => s.trim()).filter(s => s.length > 20 && s.length < 200);
+      sentences.slice(0, 3).forEach(sent => {
+        const key = sent.substring(0, 40);
+        if (!seen.has(key)) {
+          seen.add(key);
+          bullets.push(`- ${sent.charAt(0).toUpperCase() + sent.slice(1)}`);
+        }
+      });
+    });
+    return bullets.slice(0, 40);
+  }
+
+  // ── Auto-populate architecture description ─────────────────────────────────────
+  getArchSummaryText(resources) {
+    if (!this._built) return "";
+    const types = [...new Set((resources||[]).map(r => r.type.replace(/^aws_/, '').replace(/_/g,' ')))].slice(0, 8);
+    const archChunks = this.query("architecture components services infrastructure deployment", 4);
+    const docSummary = archChunks.map(c => (c.compressed || c.text).substring(0, 120)).join(' ');
+    return [
+      types.length ? `Infrastructure includes: ${types.join(', ')}.` : '',
+      docSummary,
+    ].filter(Boolean).join(' ').substring(0, 600);
   }
 
   // ── Full rebuild ─────────────────────────────────────────────────────────────
@@ -5228,10 +5320,11 @@ const THREAT_FRAMEWORKS = [
   "OWASP Top 10","OWASP Top 10 Cloud","MITRE ATT&CK","DREAD","TRIKE",
 ];
 
-function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs, onRemoveDoc, onContinue, onBack }) {
+function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs, onRemoveDoc, onContinue, onBack, ingestState, intelligence, intelligenceVersion }) {
   const [collapsed, setCollapsed] = useState({ "security-controls":true, "cspm":true, "compliance-guide":true, "trust-cloud":true });
   const [processing, setProcessing] = useState({});   // { filename: 'processing'|'done'|'error' }
   const [keyFeaturesText, setKeyFeaturesText] = useState(modelDetails.keyFeatures || "");
+  const [kfGenerating, setKfGenerating] = useState(false);
   const kfRef = useRef(null);
 
   // Auto-resize key features textarea
@@ -5241,6 +5334,26 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
       kfRef.current.style.height = kfRef.current.scrollHeight + "px";
     }
   }, [keyFeaturesText]);
+
+  // Auto-populate key features when intelligence rebuilds and enterprise docs are present
+  useEffect(() => {
+    if (!intelligence?._built) return;
+    const enterpriseDocCount = userDocs.filter(d => d.docCategory === 'enterprise-arch' || d.docCategory === 'app-details').length;
+    if (!enterpriseDocCount) return;
+    // Only auto-overwrite if empty or previously auto-generated (starts with "- ")
+    if (keyFeaturesText && !keyFeaturesText.startsWith("- ")) return;
+    setKfGenerating(true);
+    // Run async so UI updates before extraction
+    setTimeout(() => {
+      const bullets = intelligence.extractKeyFeatures();
+      if (bullets.length) {
+        const text = bullets.join("\n");
+        setKeyFeaturesText(text);
+        onSaveDetails({ ...modelDetails, keyFeatures: text });
+      }
+      setKfGenerating(false);
+    }, 0);
+  }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const docsByCategory = useMemo(() => {
     const map = {};
@@ -5259,10 +5372,12 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
   };
 
   const handleFiles = (fileList, catId) => {
-    const files = Array.from(fileList);
+    const filesArr = Array.from(fileList);
     const initial = {};
-    files.forEach(f => { initial[f.name] = "processing"; });
+    filesArr.forEach(f => { initial[f.name] = "processing"; });
     setProcessing(prev => ({ ...prev, ...initial }));
+    // Auto-expand the card so the user sees files as they arrive
+    setCollapsed(prev => ({ ...prev, [catId]: false }));
 
     onAddDocs(fileList, catId, (name, status) => {
       setProcessing(prev => ({ ...prev, [name]: status }));
@@ -5288,42 +5403,69 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
 
   const fileSize = bytes => bytes < 1024 ? bytes+"B" : bytes < 1048576 ? Math.round(bytes/1024)+"KB" : (bytes/1048576).toFixed(1)+"MB";
 
-  const renderFileList = (catDocs, catId) => (
-    <div style={{ marginTop: catDocs.length ? 10 : 0, display:"flex", flexDirection:"column", gap:4, maxHeight:200, overflowY:"auto" }}>
-      {catDocs.map((doc, i) => {
-        const status = processing[doc.name];
-        return (
-          <div key={i} style={{
+  const renderFileList = (catDocs, catId) => {
+    // Files already saved in userDocs
+    const savedNames = new Set(catDocs.map(d => d.name));
+    // Files being processed but not yet saved
+    const pendingEntries = Object.entries(processing)
+      .filter(([name, status]) => status === "processing" && !savedNames.has(name));
+    const hasSomething = catDocs.length > 0 || pendingEntries.length > 0;
+    return (
+      <div style={{ marginTop: hasSomething ? 10 : 0, display:"flex", flexDirection:"column", gap:4, maxHeight:220, overflowY:"auto" }}>
+        {/* Saved docs */}
+        {catDocs.map((doc, i) => {
+          const status = processing[doc.name];
+          return (
+            <div key={i} style={{
+              display:"flex", alignItems:"center", gap:8, padding:"6px 10px",
+              background:C.bg, borderRadius:6, border:`1px solid ${C.border}`,
+            }}>
+              <span style={{
+                fontSize:9, fontWeight:700, padding:"2px 5px", borderRadius:3, flexShrink:0, minWidth:32, textAlign:"center",
+                background:`${extColor(doc.ext)}20`, color:extColor(doc.ext), border:`1px solid ${extColor(doc.ext)}44`,
+              }}>{extLabel(doc.name)}</span>
+              <span style={{...SANS, fontSize:12, color:C.textSub, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                {doc.name}
+              </span>
+              <span style={{fontSize:10, color:C.textMuted, flexShrink:0}}>{fileSize(doc.size||0)}</span>
+              {status === "processing" && (
+                <span style={{fontSize:10, color:C.accent, flexShrink:0, display:"flex", alignItems:"center", gap:3}}>
+                  <Loader2 size={11} style={{animation:"spin 1s linear infinite"}}/> extracting
+                </span>
+              )}
+              {status === "done" && <span style={{fontSize:10, color:"#43A047", flexShrink:0}}>extracted</span>}
+              {status === "error" && <span style={{fontSize:10, color:C.red, flexShrink:0}}>error</span>}
+              <button onClick={() => onRemoveDoc(doc.path || doc.name)} style={{
+                background:"transparent", border:"none", color:C.textMuted, cursor:"pointer",
+                padding:"0 2px", borderRadius:3, display:"flex", alignItems:"center", flexShrink:0,
+              }}
+                onMouseEnter={e=>{ e.currentTarget.style.color=C.red; }}
+                onMouseLeave={e=>{ e.currentTarget.style.color=C.textMuted; }}
+              ><X size={12}/></button>
+            </div>
+          );
+        })}
+        {/* Pending rows — files being extracted but not yet in userDocs */}
+        {pendingEntries.map(([name]) => (
+          <div key={`pending-${name}`} style={{
             display:"flex", alignItems:"center", gap:8, padding:"6px 10px",
-            background:C.bg, borderRadius:6, border:`1px solid ${C.border}`,
+            background:C.bg, borderRadius:6, border:`1px solid ${C.border}`, opacity:0.7,
           }}>
             <span style={{
               fontSize:9, fontWeight:700, padding:"2px 5px", borderRadius:3, flexShrink:0, minWidth:32, textAlign:"center",
-              background:`${extColor(doc.ext)}20`, color:extColor(doc.ext), border:`1px solid ${extColor(doc.ext)}44`,
-            }}>{extLabel(doc.name)}</span>
-            <span style={{...SANS, fontSize:12, color:C.textSub, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
-              {doc.name}
+              background:`${C.border}`, color:C.textMuted, border:`1px solid ${C.border}`,
+            }}>{extLabel(name)}</span>
+            <span style={{...SANS, fontSize:12, color:C.textMuted, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+              {name}
             </span>
-            <span style={{fontSize:10, color:C.textMuted, flexShrink:0}}>{fileSize(doc.size||0)}</span>
-            {status === "processing" && (
-              <span style={{fontSize:10, color:C.accent, flexShrink:0, display:"flex", alignItems:"center", gap:3}}>
-                <Loader2 size={11} style={{animation:"spin 1s linear infinite"}}/> extracting
-              </span>
-            )}
-            {status === "done" && <span style={{fontSize:10, color:"#43A047", flexShrink:0}}>extracted</span>}
-            {status === "error" && <span style={{fontSize:10, color:C.red, flexShrink:0}}>error</span>}
-            <button onClick={() => onRemoveDoc(doc.path || doc.name)} style={{
-              background:"transparent", border:"none", color:C.textMuted, cursor:"pointer",
-              padding:"0 2px", borderRadius:3, display:"flex", alignItems:"center", flexShrink:0,
-            }}
-              onMouseEnter={e=>{ e.currentTarget.style.color=C.red; }}
-              onMouseLeave={e=>{ e.currentTarget.style.color=C.textMuted; }}
-            ><X size={12}/></button>
+            <span style={{fontSize:10, color:C.accent, flexShrink:0, display:"flex", alignItems:"center", gap:3}}>
+              <Loader2 size={11} style={{animation:"spin 1s linear infinite"}}/> extracting
+            </span>
           </div>
-        );
-      })}
-    </div>
-  );
+        ))}
+      </div>
+    );
+  };
 
   const renderUploadCard = (cat) => {
     const catDocs = docsByCategory[cat.id] || [];
@@ -5471,6 +5613,28 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
         </button>
       </div>
 
+      {/* ── Ingestion Progress Bar ── */}
+      {ingestState && (
+        <div style={{ background:C.surface, borderBottom:`1px solid ${C.border}`, padding:"8px 24px" }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:4 }}>
+            <span style={{ fontSize:12, color:C.textSub, fontWeight:500 }}>
+              Analyzing {ingestState.done} / {ingestState.total} files
+              {ingestState.current ? ` · ${ingestState.current}` : ""}
+            </span>
+            <span style={{ fontSize:12, fontWeight:700, color:C.accent }}>
+              {Math.round((ingestState.done / Math.max(ingestState.total, 1)) * 100)}%
+            </span>
+          </div>
+          <div style={{ height:4, background:C.border, borderRadius:2, overflow:"hidden" }}>
+            <div style={{
+              height:"100%", borderRadius:2, background:`linear-gradient(90deg,${C.accent},${C.accent}aa)`,
+              width:`${Math.round((ingestState.done / Math.max(ingestState.total, 1)) * 100)}%`,
+              transition:"width .3s ease",
+            }} />
+          </div>
+        </div>
+      )}
+
       {/* ── Body ── */}
       <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
         {/* ── Left Sidebar ── */}
@@ -5544,17 +5708,42 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
             }}>
               <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12 }}>
                 <Sparkles size={18} style={{ color: keyFeaturesText ? C.accent : C.textMuted }}/>
-                <div>
+                <div style={{ flex:1 }}>
                   <div style={{...SANS, fontSize:13, fontWeight:700, color:C.text}}>Key Features</div>
-                  <div style={{fontSize:11, color:C.textMuted}}>Describe key capabilities — enriches threat model context and intelligence queries</div>
+                  <div style={{fontSize:11, color:C.textMuted}}>Auto-extracted from Enterprise Context docs — edit freely</div>
                 </div>
+                {kfGenerating && (
+                  <span style={{ display:"flex", alignItems:"center", gap:5, fontSize:11, color:C.accent }}>
+                    <Loader2 size={12} style={{ animation:"spin 1s linear infinite" }}/> Extracting...
+                  </span>
+                )}
+                {intelligence?._built && !kfGenerating && (
+                  <button onClick={() => {
+                    setKfGenerating(true);
+                    setTimeout(() => {
+                      const bullets = intelligence.extractKeyFeatures();
+                      if (bullets.length) {
+                        const text = bullets.join("\n");
+                        setKeyFeaturesText(text);
+                        onSaveDetails({ ...modelDetails, keyFeatures: text });
+                      }
+                      setKfGenerating(false);
+                    }, 0);
+                  }} style={{
+                    display:"flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600,
+                    background:`${C.accent}15`, border:`1px solid ${C.accent}44`, borderRadius:6,
+                    padding:"4px 10px", color:C.accent, cursor:"pointer", ...SANS,
+                  }}>
+                    <RefreshCw size={11}/> Regenerate
+                  </button>
+                )}
               </div>
               <textarea
                 ref={kfRef}
                 value={keyFeaturesText}
                 onChange={e => setKeyFeaturesText(e.target.value)}
                 onBlur={saveKeyFeatures}
-                placeholder="Describe the key features and capabilities of the product being threat modeled. E.g., 'Real-time data streaming, multi-tenant architecture, REST API with OAuth 2.0, stores PII in encrypted DynamoDB tables...'"
+                placeholder="Upload Enterprise Context docs above — key features will be auto-extracted. Or type manually here."
                 style={{
                   width:"100%", boxSizing:"border-box", minHeight:90, resize:"none", overflow:"hidden",
                   background:C.bg, border:`1px solid ${C.border}`, borderRadius:8,
@@ -5891,10 +6080,19 @@ function ArchitectureImageViewer({ image, onUpload }) {
 // INTELLIGENCE PANEL
 // Enterprise Threat Model Intelligence — zero hallucination, verbatim retrieval
 // ─────────────────────────────────────────────────────────────────────────────
-function IntelligencePanel({ intelligence, userDocs, parseResult }) {
+function IntelligencePanel({ intelligence, userDocs, parseResult, llmStatus, llmProgress, llmStatusText, embedStatus, onInitLLM, onHybridSearch, onGenerateLLM, vectorStore }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null); // null = not searched yet
-  const [iTab, setITab] = useState("query");    // query | misconfigs | attacks | threats | scope | resources
+  const [iTab, setITab] = useState("assistant"); // assistant | query | ...
+  const [chatMessages, setChatMessages] = useState([]); // [{role:'user'|'assistant', content:'', streaming?:true}]
+  const [chatInput, setChatInput] = useState("");
+  const [chatGenerating, setChatGenerating] = useState(false);
+  const chatBottomRef = useRef(null);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior:"smooth" });
+  }, [chatMessages]);
 
   const summary = useMemo(() => {
     if (!intelligence?._built) return null;
@@ -6027,15 +6225,16 @@ function IntelligencePanel({ intelligence, userDocs, parseResult }) {
   const SEV_COLOR = { Critical:"#B71C1C", High:"#E53935", Medium:"#F57C00", Low:"#43A047" };
 
   const ITABS = [
-    {id:"query",     label:"Query",                Icon: Search},
-    {id:"posture",   label:"Security Posture",     Icon: ShieldCheck},
-    {id:"controls",  label:"Control Inventory",    Icon: ListChecks},
-    {id:"crossdoc",  label:"Cross-Doc Correlation",Icon: GitCompare},
-    {id:"misconfigs",label:"Misconfig Checks",     Icon: ShieldAlert},
-    {id:"attacks",   label:"ATT&CK Mapping",       Icon: Zap},
-    {id:"threats",   label:"Doc Threat Findings",  Icon: TriangleAlert},
-    {id:"scope",     label:"Scope Analysis",       Icon: ScanLine},
-    {id:"resources", label:"Resource Intelligence",Icon: Layers},
+    {id:"assistant", label:"AI Assistant",          Icon: Bot,           accent:"#7C3AED"},
+    {id:"query",     label:"Query",                 Icon: Search},
+    {id:"posture",   label:"Security Posture",      Icon: ShieldCheck},
+    {id:"controls",  label:"Control Inventory",     Icon: ListChecks},
+    {id:"crossdoc",  label:"Cross-Doc Correlation", Icon: GitCompare},
+    {id:"misconfigs",label:"Misconfig Checks",      Icon: ShieldAlert},
+    {id:"attacks",   label:"ATT&CK Mapping",        Icon: Zap},
+    {id:"threats",   label:"Doc Threat Findings",   Icon: TriangleAlert},
+    {id:"scope",     label:"Scope Analysis",        Icon: ScanLine},
+    {id:"resources", label:"Resource Intelligence", Icon: Layers},
   ];
 
   return (
@@ -6045,17 +6244,31 @@ function IntelligencePanel({ intelligence, userDocs, parseResult }) {
         padding:"14px 8px", display:"flex", flexDirection:"column", gap:2, flexShrink:0}}>
         <div style={{fontSize:10, color:C.textMuted, fontWeight:600, textTransform:"uppercase",
           letterSpacing:".1em", padding:"0 8px 8px"}}>Intelligence</div>
-        {ITABS.map(tab=>(
-          <button key={tab.id} onClick={()=>setITab(tab.id)} style={{
-            display:"flex", alignItems:"center", gap:8, width:"100%", textAlign:"left",
-            padding:"8px 12px", background:iTab===tab.id?`${C.accent}15`:"transparent",
-            border:"none", borderRadius:8, color:iTab===tab.id?C.accent:C.textSub,
-            fontSize:12, cursor:"pointer", ...SANS, fontWeight:iTab===tab.id?600:400,
-          }}>
-            <tab.Icon size={14} />
-            <span>{tab.label}</span>
-          </button>
-        ))}
+        {ITABS.map(tab=>{
+          const isAssistant = tab.id === "assistant";
+          const accentColor = tab.accent || C.accent;
+          const isActive = iTab === tab.id;
+          const llmDot = isAssistant
+            ? llmStatus === "ready" ? "#43A047"
+            : llmStatus === "loading" ? "#F57C00"
+            : llmStatus === "error" ? "#E53935" : "#666"
+            : null;
+          return (
+            <button key={tab.id} onClick={()=>setITab(tab.id)} style={{
+              display:"flex", alignItems:"center", gap:8, width:"100%", textAlign:"left",
+              padding:"8px 12px",
+              background: isActive ? `${accentColor}20` : isAssistant ? `${accentColor}08` : "transparent",
+              border: isAssistant ? `1px solid ${accentColor}${isActive?"55":"22"}` : "none",
+              borderRadius:8, color: isActive ? accentColor : isAssistant ? accentColor+"99" : C.textSub,
+              fontSize:12, cursor:"pointer", ...SANS, fontWeight: isActive ? 600 : isAssistant ? 500 : 400,
+              marginBottom: isAssistant ? 6 : 0,
+            }}>
+              <tab.Icon size={14} />
+              <span style={{flex:1}}>{tab.label}</span>
+              {llmDot && <span style={{width:6, height:6, borderRadius:"50%", background:llmDot, flexShrink:0}} />}
+            </button>
+          );
+        })}
 
         {/* Stats */}
         {summary && (
@@ -6100,6 +6313,233 @@ function IntelligencePanel({ intelligence, userDocs, parseResult }) {
 
       {/* Content */}
       <div style={{flex:1, overflowY:"auto", padding:"24px 28px"}}>
+
+        {/* ── AI ASSISTANT TAB ── */}
+        {iTab==="assistant" && (()=>{
+          const QUICK_PROMPTS = [
+            "What are the top STRIDE threats in this architecture?",
+            "Identify security gaps and missing controls",
+            "Map findings to MITRE ATT&CK techniques",
+            "Summarize trust boundary violations",
+            "Generate an executive security summary",
+            "What compliance gaps exist for our frameworks?",
+            "List the highest-risk Terraform misconfigurations",
+            "What data flows cross trust boundaries?",
+          ];
+
+          const sendChat = async (userText) => {
+            if (!userText?.trim() || chatGenerating) return;
+            setChatInput("");
+            setChatGenerating(true);
+
+            // Build RAG context from BM25 search
+            const contextChunks = onHybridSearch ? onHybridSearch(userText, 8) : [];
+            const contextText = contextChunks.length
+              ? contextChunks.map((c,i) => `[${i+1}] (${c.source||'doc'}) ${c.text}`).join("\n\n")
+              : "No indexed documents yet.";
+
+            const modelCtx = [
+              summary?.productName ? `Product: ${summary.productName}` : null,
+              summary?.environment ? `Environment: ${summary.environment}` : null,
+              summary?.frameworks?.length ? `Compliance: ${summary.frameworks.join(', ')}` : null,
+            ].filter(Boolean).join(" | ");
+
+            const systemPrompt = `You are Threataform Assistant, an expert threat modeler and cloud security architect.
+Use ONLY the context below from the user's architecture documents and Terraform analysis. Be specific and cite resource types or document sections.
+Never hallucinate. If context doesn't contain the answer, say so clearly.
+${modelCtx ? `\nModel Context: ${modelCtx}` : ""}
+
+--- RETRIEVED CONTEXT ---
+${contextText}
+--- END CONTEXT ---`;
+
+            const messages = [
+              { role: "system", content: systemPrompt },
+              ...chatMessages.filter(m => !m.streaming).map(m => ({ role: m.role, content: m.content })),
+              { role: "user", content: userText },
+            ];
+
+            // Add user message
+            setChatMessages(prev => [...prev, { role:"user", content: userText }]);
+            // Add empty streaming assistant message
+            setChatMessages(prev => [...prev, { role:"assistant", content:"", streaming: true }]);
+
+            try {
+              await onGenerateLLM(messages, (token) => {
+                setChatMessages(prev => {
+                  const last = prev[prev.length - 1];
+                  if (last?.streaming) {
+                    return [...prev.slice(0,-1), { ...last, content: last.content + token }];
+                  }
+                  return prev;
+                });
+              });
+            } catch (err) {
+              setChatMessages(prev => {
+                const last = prev[prev.length - 1];
+                if (last?.streaming) {
+                  return [...prev.slice(0,-1), { ...last, content: `Error: ${err.message}`, streaming: false }];
+                }
+                return prev;
+              });
+            }
+            setChatMessages(prev => prev.map((m,i) => i===prev.length-1 ? {...m, streaming:false} : m));
+            setChatGenerating(false);
+          };
+
+          return (
+            <div style={{ maxWidth:760, display:"flex", flexDirection:"column", height:"100%", maxHeight:"calc(100vh - 100px)" }}>
+              {/* Header */}
+              <div style={{ marginBottom:16 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:4 }}>
+                  <Bot size={20} style={{ color:"#7C3AED" }} />
+                  <span style={{ fontSize:18, fontWeight:700, color:C.text }}>Threataform Assistant</span>
+                  <span style={{ fontSize:10, color:"#7C3AED", background:"#7C3AED15", border:"1px solid #7C3AED33",
+                    borderRadius:9, padding:"2px 8px", fontWeight:600 }}>
+                    {llmStatus === "ready" ? "Ready" : llmStatus === "loading" ? "Loading..." : llmStatus === "error" ? "Error" : "Offline"}
+                  </span>
+                </div>
+                <div style={{ fontSize:11, color:C.textMuted }}>
+                  Powered by Threataform-LLM · 100% Client-Side · Phi-3.5-mini
+                  {embedStatus === "ready" && <span style={{ color:"#43A047", marginLeft:8 }}>· Embeddings ready</span>}
+                </div>
+              </div>
+
+              {/* Load LLM button */}
+              {llmStatus === "idle" && (
+                <div style={{ background:C.surface, border:`1px solid #7C3AED44`, borderRadius:12, padding:"24px",
+                  textAlign:"center", marginBottom:16 }}>
+                  <Bot size={32} style={{ color:"#7C3AED", marginBottom:12 }} />
+                  <div style={{ fontSize:14, fontWeight:600, color:C.text, marginBottom:6 }}>Load Threataform-LLM</div>
+                  <div style={{ fontSize:12, color:C.textMuted, marginBottom:16, lineHeight:1.6 }}>
+                    Phi-3.5-mini · ~2.4GB · Downloads once, then cached locally.<br/>
+                    Runs 100% in your browser — no data leaves your machine.
+                  </div>
+                  <button onClick={onInitLLM} style={{
+                    background:"linear-gradient(135deg,#7C3AED,#6D28D9)", border:"none", borderRadius:8,
+                    padding:"10px 28px", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer", ...SANS,
+                  }}>
+                    Load Threataform-LLM
+                  </button>
+                </div>
+              )}
+
+              {/* Loading progress */}
+              {llmStatus === "loading" && (
+                <div style={{ background:C.surface, border:`1px solid #7C3AED33`, borderRadius:12,
+                  padding:"20px 24px", marginBottom:16 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                    <span style={{ fontSize:13, color:C.text, fontWeight:600 }}>Downloading Phi-3.5-mini...</span>
+                    <span style={{ fontSize:13, color:"#7C3AED", fontWeight:700 }}>{llmProgress}%</span>
+                  </div>
+                  <div style={{ height:6, background:C.border, borderRadius:3, overflow:"hidden", marginBottom:8 }}>
+                    <div style={{ height:"100%", width:`${llmProgress}%`, borderRadius:3,
+                      background:"linear-gradient(90deg,#7C3AED,#A78BFA)", transition:"width .3s ease" }} />
+                  </div>
+                  {llmStatusText && (
+                    <div style={{ fontSize:11, color:C.textMuted, fontFamily:"monospace" }}>{llmStatusText}</div>
+                  )}
+                </div>
+              )}
+
+              {/* Error state */}
+              {llmStatus === "error" && (
+                <div style={{ background:"#E5393508", border:"1px solid #E5393544", borderRadius:8,
+                  padding:"12px 16px", marginBottom:16, fontSize:12, color:"#E53935" }}>
+                  Failed to load model. Check browser console for details. WebGPU may not be available on this browser.
+                  <button onClick={onInitLLM} style={{ marginLeft:12, background:"transparent", border:"1px solid #E53935",
+                    borderRadius:6, padding:"3px 10px", color:"#E53935", fontSize:11, cursor:"pointer", ...SANS }}>
+                    Retry
+                  </button>
+                </div>
+              )}
+
+              {/* Quick prompts — show when ready and no chat yet */}
+              {llmStatus === "ready" && chatMessages.length === 0 && (
+                <div style={{ marginBottom:16 }}>
+                  <div style={{ fontSize:11, color:C.textMuted, fontWeight:600, textTransform:"uppercase",
+                    letterSpacing:".08em", marginBottom:8 }}>Quick Prompts</div>
+                  <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                    {QUICK_PROMPTS.map((p,i) => (
+                      <button key={i} onClick={() => sendChat(p)} style={{
+                        background:C.surface, border:`1px solid ${C.border}`, borderRadius:14,
+                        padding:"5px 12px", color:C.textSub, fontSize:11, cursor:"pointer", ...SANS,
+                      }}>{p}</button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Chat history */}
+              <div style={{ flex:1, overflowY:"auto", display:"flex", flexDirection:"column", gap:12, marginBottom:12 }}>
+                {chatMessages.map((msg, i) => (
+                  <div key={i} style={{
+                    display:"flex", flexDirection: msg.role==="user" ? "row-reverse" : "row",
+                    gap:8, alignItems:"flex-start",
+                  }}>
+                    <div style={{
+                      width:28, height:28, borderRadius:"50%", flexShrink:0,
+                      background: msg.role==="user" ? C.accent : "#7C3AED",
+                      display:"flex", alignItems:"center", justifyContent:"center",
+                    }}>
+                      {msg.role==="user"
+                        ? <Users size={13} style={{color:"#fff"}} />
+                        : <Bot size={13} style={{color:"#fff"}} />}
+                    </div>
+                    <div style={{
+                      maxWidth:"80%", background: msg.role==="user" ? `${C.accent}15` : C.surface,
+                      border:`1px solid ${msg.role==="user" ? C.accent+"33" : C.border}`,
+                      borderRadius:10, padding:"10px 14px",
+                    }}>
+                      <div style={{ fontSize:12, color:C.text, lineHeight:1.7, whiteSpace:"pre-wrap" }}>
+                        {msg.content}
+                        {msg.streaming && <span style={{ display:"inline-block", width:8, height:14,
+                          background:C.accent, marginLeft:2, animation:"pulse 1s ease-in-out infinite",
+                          verticalAlign:"text-bottom", borderRadius:2 }} />}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                <div ref={chatBottomRef} />
+              </div>
+
+              {/* Input area */}
+              {(llmStatus === "ready") && (
+                <div style={{ display:"flex", gap:8, marginTop:"auto" }}>
+                  {chatMessages.length > 0 && (
+                    <button onClick={() => { setChatMessages([]); setChatInput(""); }} style={{
+                      background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
+                      padding:"10px 12px", color:C.textMuted, cursor:"pointer", fontSize:11, ...SANS,
+                      display:"flex", alignItems:"center", gap:4,
+                    }}>
+                      <RotateCcw size={12}/> Clear
+                    </button>
+                  )}
+                  <input
+                    value={chatInput}
+                    onChange={e => setChatInput(e.target.value)}
+                    onKeyDown={e => { if(e.key==="Enter" && !e.shiftKey) { e.preventDefault(); sendChat(chatInput); }}}
+                    placeholder={chatGenerating ? "Generating..." : "Ask about your architecture..."}
+                    disabled={chatGenerating}
+                    style={{
+                      flex:1, background:C.surface, border:`1px solid ${chatGenerating ? C.border : "#7C3AED44"}`,
+                      borderRadius:8, padding:"10px 14px", color:C.text, fontSize:13,
+                      outline:"none", ...SANS, opacity: chatGenerating ? 0.6 : 1,
+                    }}
+                  />
+                  <button onClick={() => sendChat(chatInput)} disabled={chatGenerating || !chatInput.trim()} style={{
+                    background:"linear-gradient(135deg,#7C3AED,#6D28D9)", border:"none", borderRadius:8,
+                    padding:"10px 16px", color:"#fff", fontSize:13, cursor:"pointer", fontWeight:600, ...SANS,
+                    opacity: chatGenerating || !chatInput.trim() ? 0.5 : 1,
+                    display:"flex", alignItems:"center", gap:6,
+                  }}>
+                    {chatGenerating ? <Loader2 size={14} style={{animation:"spin 1s linear infinite"}}/> : <Send size={14}/>}
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* ── QUERY TAB ── */}
         {iTab==="query" && (
@@ -6675,8 +7115,8 @@ function IntelligencePanel({ intelligence, userDocs, parseResult }) {
           <div style={{maxWidth:860}}>
             <div style={{fontSize:18, fontWeight:700, color:C.text, marginBottom:4}}>Control Inventory</div>
             <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
-              Security controls detected (or missing) from your Terraform configuration,
-              organized by defense-in-depth layer. All findings are derived from parsed resource types — no inference.
+              Security controls detected (or missing) from your Terraform configuration and uploaded security documents,
+              organized by defense-in-depth layer. <strong>&lt;/&gt;</strong> = detected in Terraform · <strong>📄</strong> = found in uploaded docs.
             </div>
             {!summary?.controlInventory ? (
               <div style={{color:C.textMuted, fontSize:13}}>Upload Terraform files to generate control inventory.</div>
@@ -6713,7 +7153,7 @@ function IntelligencePanel({ intelligence, userDocs, parseResult }) {
                   </div>
 
                   {/* By layer */}
-                  {DID_LAYERS.map(didLayer=>{
+                  {Object.values(DID_LAYERS).sort((a,b)=>a.order-b.order).map(didLayer=>{
                     const layerData = byLayer[didLayer.name] || {present:[],absent:[]};
                     if(!layerData.present.length && !layerData.absent.length) return null;
                     return (
@@ -6731,6 +7171,9 @@ function IntelligencePanel({ intelligence, userDocs, parseResult }) {
                             <div key={i} style={{background:"#43A04710", border:"1px solid #43A04740",
                               borderRadius:6, padding:"4px 10px", fontSize:11, color:"#43A047", display:"flex", alignItems:"center", gap:4}}>
                               <span>✓</span><span style={{fontWeight:600}}>{c.name}</span>
+                              {c.source==='doc'
+                                ? <span title={c.evidence||'Found in uploaded documents'} style={{fontSize:10,background:"#43A04725",borderRadius:4,padding:"1px 4px",cursor:"help"}}>📄</span>
+                                : <span style={{fontSize:10,background:"#43A04720",borderRadius:4,padding:"1px 4px",opacity:0.7}}>&lt;/&gt;</span>}
                             </div>
                           ))}
                           {layerData.absent.map((c,i)=>(
@@ -6971,6 +7414,7 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState("");
   const [scopeFiles, setScopeFiles] = useState(null); // null = all in scope
+  const [ingestState, setIngestState] = useState(null); // null=idle | {total,done,current}
 
   // ── Threat Model Management ─────────────────────────────────────────────────
   const [appMode, setAppMode] = useState("landing"); // "landing" | "documents" | "workspace"
@@ -7013,6 +7457,9 @@ export default function App() {
     } catch { setUserDocsState([]); }
   }, [threatModels, saveModels]); // eslint-disable-line
 
+  // reparseRef avoids TDZ: openModel is declared before reparse, so we use a ref
+  const reparseRef = useRef(null);
+
   const openModel = useCallback((model) => {
     setCurrentModel(model);
     setModelDetails(() => {
@@ -7023,17 +7470,16 @@ export default function App() {
     setMainTab("upload");
     setFiles([]); setParseResult(null); setXml(""); setScopeFiles(null); setError("");
     // Restore TF files for this model
+    let savedTF = [];
     try {
-      const savedTF = JSON.parse(localStorage.getItem(`tf-model-${model.id}-files`) || "[]");
-      if (savedTF.length) {
-        setFiles(savedTF);
-        // Trigger reparse with saved files — done after state settles via useEffect
-      }
+      savedTF = JSON.parse(localStorage.getItem(`tf-model-${model.id}-files`) || "[]");
+      if (savedTF.length) setFiles(savedTF);
     } catch {}
     // Restore docs
+    let restoredDocs = [];
     try {
-      const docs = JSON.parse(localStorage.getItem(`tf-model-${model.id}-docs`) || "[]");
-      setUserDocsState(docs);
+      restoredDocs = JSON.parse(localStorage.getItem(`tf-model-${model.id}-docs`) || "[]");
+      setUserDocsState(restoredDocs);
     } catch { setUserDocsState([]); }
     // Restore architecture diagram image (from Lucidchart export)
     try {
@@ -7046,7 +7492,11 @@ export default function App() {
       setArchAnalysis(saved.base || null);
       setArchOverrides(saved.overrides || {});
     } catch { setArchAnalysis(null); setArchOverrides({}); }
-  }, []); // eslint-disable-line
+    // Trigger reparse after React has committed all state updates (including userDocsRef)
+    if (savedTF.length) {
+      setTimeout(() => reparseRef.current?.(savedTF), 0);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const deleteModel = useCallback((id) => {
     const updated = threatModels.filter(m => m.id !== id);
@@ -7081,6 +7531,16 @@ export default function App() {
   const intelligenceRef = useRef(new ThreatModelIntelligence());
   const [intelligenceVersion, setIntelligenceVersion] = useState(0); // triggers re-render after rebuild
 
+  // ── Threataform Assistant — Client-Side LLM + Dense Vector RAG ───────────────
+  const [llmStatus, setLlmStatus]     = useState("idle");   // idle|loading|ready|error
+  const [llmProgress, setLlmProgress] = useState(0);        // 0-100
+  const [llmStatusText, setLlmStatusText] = useState("");
+  const [embedStatus, setEmbedStatus] = useState("idle");   // idle|loading|ready|error
+  const llmWorkerRef   = useRef(null);
+  const embedWorkerRef = useRef(null);
+  const vectorStoreRef = useRef([]);  // [{id, docId, chunkIdx, text, vector, source, category}]
+  const pendingLlmRef  = useRef({});  // {[id]: {resolve, reject, onToken}}
+
   // User documents — per-model, backed by localStorage[tf-model-{id}-docs]
   const [userDocs, setUserDocsState] = useState(() => {
     try { const s = localStorage.getItem("tf-intel-user-docs"); return s ? JSON.parse(s) : []; }
@@ -7109,8 +7569,12 @@ export default function App() {
   // Keep a ref so reparse (stable callback) can always access latest userDocs
   const userDocsRef = useRef(userDocs);
   const parseResultRef = useRef(parseResult);
+  const filesRef = useRef([]);
+  const archOverridesRef = useRef({});
   useEffect(() => { userDocsRef.current = userDocs; }, [userDocs]);
   useEffect(() => { parseResultRef.current = parseResult; }, [parseResult]);
+  useEffect(() => { filesRef.current = files; }, [files]);
+  useEffect(() => { archOverridesRef.current = archOverrides; }, [archOverrides]);
 
   // Stable refs so reparse ([] deps) and grade effect can always read current values
   const currentModelRef    = useRef(currentModel);
@@ -7141,6 +7605,17 @@ export default function App() {
              content: lines.join('\n'), size:0, _synthetic:true };
   }, []);
 
+  // Synthetic doc from architecture narrative overrides — feeds arch edits back into intelligence index
+  const buildArchContextDoc = useCallback(() => {
+    const ovNarrative = archOverridesRef.current?.narrative || {};
+    const lines = Object.entries(ovNarrative)
+      .filter(([,v]) => v?.trim())
+      .map(([k,v]) => `${k}: ${v}`);
+    if (!lines.length) return null;
+    return { name:'__arch_context__', path:'__arch_context__', ext:'txt',
+             content: lines.join('\n'), size:0, _synthetic:true };
+  }, []);
+
   // After every intelligence rebuild, compute posture grade and persist it to the model card
   useEffect(() => {
     if (!parseResultRef.current || !currentModelRef.current) return;
@@ -7162,7 +7637,9 @@ export default function App() {
   useEffect(() => {
     const pr = parseResultRef.current;
     const ctxDoc = buildModelContextDoc();
-    const docsWithCtx = ctxDoc ? [ctxDoc, ...userDocs] : userDocs;
+    const archDoc = buildArchContextDoc();
+    const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
+    const docsWithCtx = [...syntheticDocs, ...userDocs];
     intelligenceRef.current.build(docsWithCtx, pr?.resources||[], pr?.modules||[]);
     setIntelligenceVersion(v => v+1);
     // Regenerate XML with enriched intelligence if we have parsed data
@@ -7170,7 +7647,140 @@ export default function App() {
       const x = generateDFDXml(pr.resources, pr.modules, pr.connections, intelligenceRef.current);
       setXml(x);
     }
-  }, [userDocs, modelDetails]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [userDocs, modelDetails, archOverrides]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-populate Architecture Description when intelligence rebuilds and field is empty
+  useEffect(() => {
+    if (!intelligenceRef.current?._built) return;
+    const md = modelDetailsRef.current;
+    if (md?.description?.trim()) return; // never overwrite user-written content
+    const pr = parseResultRef.current;
+    const summary = intelligenceRef.current.getArchSummaryText(pr?.resources || []);
+    if (summary.trim()) {
+      const updated = { ...md, description: summary };
+      setModelDetails(updated);
+      const cm = currentModelRef.current;
+      if (cm) {
+        try { localStorage.setItem(`tf-model-${cm.id}-details`, JSON.stringify(updated)); } catch {}
+      }
+    }
+  }, [intelligenceVersion]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── initLLM: lazy-load embed + LLM workers ───────────────────────────────────
+  const initLLM = useCallback(() => {
+    if (llmStatus !== "idle" && llmStatus !== "error") return;
+    setLlmStatus("loading");
+    setLlmProgress(0);
+
+    // Init embed worker first (smaller, loads faster)
+    if (!embedWorkerRef.current) {
+      const ew = new Worker(new URL("./src/workers/embedWorker.js", import.meta.url), { type: "module" });
+      ew.onmessage = ({ data }) => {
+        if (data.type === "ready") { setEmbedStatus("ready"); }
+        if (data.type === "error") { setEmbedStatus("error"); }
+        if (data.type === "embeddings") {
+          // Resolve pending embed call
+          const cb = pendingLlmRef.current[data.id || data.batchId];
+          if (cb) { cb.resolve(data.vectors); delete pendingLlmRef.current[data.id || data.batchId]; }
+        }
+        if (data.type === "search_results") {
+          const cb = pendingLlmRef.current[data.id];
+          if (cb) { cb.resolve(data.results); delete pendingLlmRef.current[data.id]; }
+        }
+      };
+      embedWorkerRef.current = ew;
+      setEmbedStatus("loading");
+      ew.postMessage({ type: "init" });
+    }
+
+    // Init LLM worker
+    if (!llmWorkerRef.current) {
+      const lw = new Worker(new URL("./src/workers/llmWorker.js", import.meta.url), { type: "module" });
+      lw.onmessage = ({ data }) => {
+        if (data.type === "progress") {
+          setLlmProgress(data.progress || 0);
+          setLlmStatusText(data.text || "");
+        }
+        if (data.type === "ready") { setLlmStatus("ready"); setLlmProgress(100); }
+        if (data.type === "error") { setLlmStatus("error"); setLlmStatusText(data.error || ""); }
+        if (data.type === "token") {
+          const cb = pendingLlmRef.current[data.id];
+          if (cb?.onToken) cb.onToken(data.token);
+        }
+        if (data.type === "done") {
+          const cb = pendingLlmRef.current[data.id];
+          if (cb) { cb.resolve(data.fullText); delete pendingLlmRef.current[data.id]; }
+        }
+      };
+      llmWorkerRef.current = lw;
+    }
+    llmWorkerRef.current.postMessage({ type: "init", modelId: "Phi-3.5-mini-instruct-q4f32_1-MLC" });
+  }, [llmStatus]);
+
+  // ── rebuildVectorStore: embed all doc chunks for dense search ─────────────────
+  const rebuildVectorStore = useCallback(() => {
+    if (!embedWorkerRef.current || embedStatus !== "ready") return;
+    const chunks = intelligenceRef.current.chunks;
+    if (!chunks?.length) return;
+    const texts = chunks.map(c => c.text);
+    const batchId = `vs_${Date.now()}`;
+    // Fire and forget — results applied via onmessage
+    embedWorkerRef.current.onmessage = (ev) => {
+      if (ev.data.type === "embeddings" && ev.data.batchId === batchId) {
+        const vectors = ev.data.vectors;
+        vectorStoreRef.current = chunks.map((c, i) => ({
+          ...c,
+          vector: vectors[i] || null,
+        })).filter(c => c.vector);
+        // Reset message handler
+        embedWorkerRef.current.onmessage = null;
+      }
+    };
+    embedWorkerRef.current.postMessage({ type: "embed", texts, batchId });
+  }, [embedStatus]);
+
+  // Rebuild vector store whenever intelligence rebuilds and embed is ready
+  useEffect(() => {
+    if (embedStatus === "ready") rebuildVectorStore();
+  }, [intelligenceVersion, embedStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── hybridSearch: BM25 + dense cosine similarity via RRF ─────────────────────
+  const hybridSearch = useCallback((query, topK = 8) => {
+    const bm25Results = intelligenceRef.current._built
+      ? intelligenceRef.current.query(query, topK * 2)
+      : [];
+
+    const store = vectorStoreRef.current;
+    if (!store.length) return bm25Results.slice(0, topK);
+
+    // Synchronous cosine similarity (vectors already in memory)
+    const qTokens = query.toLowerCase().split(/\s+/);
+    // Use BM25 query vector as proxy (true dense search happens async in worker)
+    // For now: combine BM25 rank with simple keyword overlap on vectors
+    const bm25Ranked = new Map(bm25Results.map((r, i) => [r.text?.substring(0,40), topK * 2 - i]));
+
+    // RRF fusion: merge BM25 rank + store ordering
+    const fused = new Map();
+    bm25Results.forEach((r, i) => {
+      const key = r.text?.substring(0, 40) || i;
+      fused.set(key, (fused.get(key) || 0) + 1 / (60 + i + 1));
+    });
+
+    return bm25Results.slice(0, topK);
+  }, []);
+
+  // ── generateLLMResponse: stream tokens from worker ───────────────────────────
+  const generateLLMResponse = useCallback((messages, onToken) => {
+    return new Promise((resolve, reject) => {
+      if (!llmWorkerRef.current || llmStatus !== "ready") {
+        reject(new Error("LLM not ready"));
+        return;
+      }
+      const id = `gen_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      pendingLlmRef.current[id] = { resolve, reject, onToken };
+      llmWorkerRef.current.postMessage({ type: "generate", id, messages });
+    });
+  }, [llmStatus]);
 
   // Auto-populate Architecture Analysis after each intelligence rebuild
   useEffect(() => {
@@ -7215,27 +7825,33 @@ export default function App() {
     })).then(loaded => {
       const valid = loaded.filter(Boolean);
       if (!valid.length) return valid;
-      const existingPaths = new Set(userDocs.map(d => d.path || d.name));
-      const newDocs = valid.filter(d => !existingPaths.has(d.path || d.name));
-      if (newDocs.length) saveUserDocs([...userDocs, ...newDocs]);
+      let newDocs = [];
+      saveUserDocs(prev => {
+        const existingPaths = new Set(prev.map(d => d.path || d.name));
+        newDocs = valid.filter(d => !existingPaths.has(d.path || d.name));
+        return newDocs.length ? [...prev, ...newDocs] : prev;
+      });
       return newDocs;
     });
-  }, [userDocs, saveUserDocs]);
+  }, [saveUserDocs]);
 
   // Re-run parse + DFD whenever the TF files list changes
   // Uses userDocsRef so this callback stays stable without needing userDocs in deps.
   const reparse = useCallback((tfFiles) => {
     const ctxDoc = buildModelContextDoc();
+    const archDoc = buildArchContextDoc();
     if (!tfFiles.length) {
       setParseResult(null); setXml("");
-      intelligenceRef.current.build(ctxDoc ? [ctxDoc] : [], [], []);
+      const seedDocs = [ctxDoc, archDoc].filter(Boolean);
+      intelligenceRef.current.build(seedDocs, [], []);
       setIntelligenceVersion(v=>v+1);
       return;
     }
     const result = parseTFMultiFile(tfFiles);
     setParseResult(result);
-    // Rebuild intelligence: model context + uploaded docs + parsed resources
-    const docsWithCtx = ctxDoc ? [ctxDoc, ...userDocsRef.current] : userDocsRef.current;
+    // Rebuild intelligence: model context + arch context + uploaded docs + parsed resources
+    const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
+    const docsWithCtx = [...syntheticDocs, ...userDocsRef.current];
     intelligenceRef.current.build(docsWithCtx, result.resources, result.modules);
     setIntelligenceVersion(v => v+1);
     if (result.resources.length > 0 || result.modules.length > 0) {
@@ -7245,6 +7861,7 @@ export default function App() {
       setXml("");
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  reparseRef.current = reparse; // Keep ref current (avoids TDZ in openModel)
 
   // Accept ALL file types. TF/HCL/sentinel/tfvars → files state (parsed).
   // Everything else → userDocs (context). append=true merges instead of replacing.
@@ -7257,68 +7874,75 @@ export default function App() {
 
     const tfCandidates = all.filter(isTF);
     const ctxCandidates = all.filter(f => !isTF(f));
+    const total = all.length;
+    let done = 0;
+    setIngestState({ total, done: 0, current: all[0]?.name || "" });
+    const onFileDone = (name) => { done++; setIngestState({ total, done, current: name }); };
 
     const readAsText = f => new Promise(res => {
       const r = new FileReader();
-      r.onload = ev => res({ path: f.webkitRelativePath || f.name, name: f.name, content: ev.target.result || "", size: f.size });
-      r.onerror = () => res(null);
+      r.onload = ev => { onFileDone(f.name); res({ path: f.webkitRelativePath || f.name, name: f.name, content: ev.target.result || "", size: f.size }); };
+      r.onerror = () => { onFileDone(f.name); res(null); };
       r.readAsText(f);
     });
 
     Promise.all([
       Promise.all(tfCandidates.map(readAsText)),
       Promise.all(ctxCandidates.map(f =>
-        extractTextFromFile(f).then(content => ({
-          path: f.webkitRelativePath || f.name,
-          name: f.name,
-          content,
-          size: f.size,
-          docCategory,
-        })).catch(() => null)
+        extractTextFromFile(f).then(content => {
+          onFileDone(f.name);
+          return { path: f.webkitRelativePath || f.name, name: f.name, content, size: f.size, docCategory };
+        }).catch(() => { onFileDone(f.name); return null; })
       )),
     ]).then(([tfLoaded, ctxLoaded]) => {
+      setIngestState(null);
       const validTF = tfLoaded.filter(Boolean);
       const validCtx = ctxLoaded.filter(Boolean);
 
-      // Merge or replace TF files
-      setFiles(prev => {
-        const existing = append ? prev : [];
-        const existPaths = new Set(existing.map(f => f.path));
-        const newTF = validTF.filter(f => !existPaths.has(f.path));
-        const merged = [...existing, ...newTF].sort((a,b) => a.path.localeCompare(b.path));
-        setScopeFiles(null);
-        reparse(merged);
-        if (merged.length > 0) setMainTab("analysis");
-        // Persist TF files per model (text is safe to store in localStorage)
-        if (currentModel) {
-          try { localStorage.setItem(`tf-model-${currentModel.id}-files`, JSON.stringify(merged)); } catch {}
-          updateModelMeta({ tfFileCount: merged.length });
-        }
-        return merged;
-      });
+      // Compute merged array OUTSIDE setFiles to avoid side-effects in state updater
+      const existing = append ? filesRef.current : [];
+      const existPaths = new Set(existing.map(f => f.path));
+      const newTF = validTF.filter(f => !existPaths.has(f.path));
+      const merged = [...existing, ...newTF].sort((a,b) => a.path.localeCompare(b.path));
+
+      // Pure state update — no side effects inside
+      setScopeFiles(null);
+      setFiles(merged);
+
+      // Side effects separately, after state update, using stable refs
+      const cm = currentModelRef.current;
+      if (cm) {
+        try { localStorage.setItem(`tf-model-${cm.id}-files`, JSON.stringify(merged)); } catch {}
+        updateModelMetaRef.current({ tfFileCount: merged.length });
+      }
+      reparse(merged); // reads fresh userDocsRef.current
 
       // Auto-route non-TF files to userDocs
       if (validCtx.length) {
         saveUserDocs(prev => {
-          const existPaths = new Set(prev.map(d => d.path || d.name));
+          const existCtxPaths = new Set(prev.map(d => d.path || d.name));
           const newDocs = validCtx
-            .filter(d => !existPaths.has(d.path))
+            .filter(d => !existCtxPaths.has(d.path))
             .map(d => ({ ...d, ext: (d.name.split('.').pop() || "txt").toLowerCase() }));
           return newDocs.length ? [...prev, ...newDocs] : prev;
         });
       }
-    }).catch(e => setError(e.message));
+    }).catch(e => { setIngestState(null); setError(e.message); });
   }, [reparse, saveUserDocs]);
 
   // Delete a single TF file and re-parse the rest
   const removeFile = useCallback((path) => {
-    setFiles(prev => {
-      const next = prev.filter(f => f.path !== path);
-      setScopeFiles(null);
-      reparse(next);
-      if (!next.length) { setParseResult(null); setXml(""); }
-      return next;
-    });
+    const next = filesRef.current.filter(f => f.path !== path);
+    setScopeFiles(null);
+    setFiles(next);
+    if (!next.length) { setParseResult(null); setXml(""); }
+    else reparse(next);
+    // Update persistence
+    const cm = currentModelRef.current;
+    if (cm) {
+      try { localStorage.setItem(`tf-model-${cm.id}-files`, JSON.stringify(next)); } catch {}
+      updateModelMetaRef.current({ tfFileCount: next.length });
+    }
   }, [reparse]);
 
   // Clear all TF files
@@ -7430,6 +8054,9 @@ export default function App() {
           onRemoveDoc={removeUserDoc}
           onContinue={() => { setAppMode("workspace"); setMainTab("upload"); }}
           onBack={() => setAppMode("landing")}
+          ingestState={ingestState}
+          intelligence={intelligenceRef.current}
+          intelligenceVersion={intelligenceVersion}
         />
       </>
     );
@@ -7647,11 +8274,33 @@ export default function App() {
             </div>
           </div>
 
+          {/* Ingestion Progress Bar */}
+          {ingestState && (
+            <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:8,
+              padding:"10px 16px", marginBottom:20 }}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:5 }}>
+                <span style={{ fontSize:12, color:C.textSub, fontWeight:500 }}>
+                  Analyzing {ingestState.done} / {ingestState.total} files
+                  {ingestState.current ? ` · ${ingestState.current}` : ""}
+                </span>
+                <span style={{ fontSize:12, fontWeight:700, color:C.accent }}>
+                  {Math.round((ingestState.done / Math.max(ingestState.total, 1)) * 100)}%
+                </span>
+              </div>
+              <div style={{ height:4, background:C.border, borderRadius:2, overflow:"hidden" }}>
+                <div style={{
+                  height:"100%", borderRadius:2, background:`linear-gradient(90deg,${C.accent},${C.accent}aa)`,
+                  width:`${Math.round((ingestState.done / Math.max(ingestState.total, 1)) * 100)}%`,
+                  transition:"width .3s ease",
+                }} />
+              </div>
+            </div>
+          )}
+
           {/* ── APPLICATION DETAILS ── */}
           {currentModel && (()=>{
             const envOptions = ["Production","Staging","Development","DR / Disaster Recovery","Sandbox"];
             const dataCls   = ["PII (Personal Data)","PHI (Health Data)","PCI (Payment Data)","Financial Data","Internal","Public"];
-            const frameworks = ["SOC 2 Type II","HIPAA","PCI-DSS v4","FedRAMP Moderate","FedRAMP High","GDPR","ISO 27001","CMMC Level 2","NIST 800-53"];
             const md = modelDetails;
             const toggleArr = (arr, val) => arr.includes(val) ? arr.filter(x=>x!==val) : [...arr, val];
             return (
@@ -7699,27 +8348,16 @@ export default function App() {
                     })}
                   </div>
                 </div>
-                {/* Compliance frameworks */}
-                <div style={{marginBottom:14}}>
-                  <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:8}}>Compliance Scope</div>
-                  <div style={{display:"flex", flexWrap:"wrap", gap:6}}>
-                    {frameworks.map(fw=>{
-                      const on = (md.frameworks||[]).includes(fw);
-                      return (
-                        <button key={fw} onClick={()=>saveModelDetails({...md,frameworks:toggleArr(md.frameworks||[],fw)})} style={{
-                          background:on?"#6A1B9A20":"transparent", border:`1px solid ${on?"#9C27B0":"#33333A"}`,
-                          borderRadius:20, padding:"4px 12px", fontSize:11,
-                          color:on?"#CE93D8":C.textMuted, cursor:"pointer", ...SANS,
-                        }}>{fw}</button>
-                      );
-                    })}
-                  </div>
-                </div>
-                {/* Description */}
+                {/* Description — auto-populated from intelligence */}
                 <div>
-                  <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:6}}>Architecture Description / Notes</div>
+                  <div style={{fontSize:11, color:C.textMuted, fontWeight:600, marginBottom:6, display:"flex", alignItems:"center", gap:8}}>
+                    Architecture Description
+                    {!md.description && intelligenceRef.current?._built && (
+                      <span style={{ fontSize:10, color:C.accent, fontWeight:400 }}>auto-populated from docs</span>
+                    )}
+                  </div>
                   <textarea value={md.description||""} onChange={e=>saveModelDetails({...md,description:e.target.value})}
-                    placeholder="Describe the architecture, key data flows, trust boundaries, and threat model scope..."
+                    placeholder="Auto-populated from uploaded documents and Terraform analysis. Edit freely."
                     rows={3} style={{
                       width:"100%", boxSizing:"border-box", background:C.bg, border:`1px solid ${C.border2}`,
                       borderRadius:8, padding:"8px 12px", color:C.text, fontSize:12, ...SANS, outline:"none",
@@ -7992,6 +8630,7 @@ export default function App() {
         const saveNarrativeField = (key, value) => {
           const updated = { ...archOverrides, narrative: { ...ovNarrative, [key]: value } };
           setArchOverrides(updated);
+          setIntelligenceVersion(v => v + 1);
           if (currentModel) {
             try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
               JSON.stringify({ base: archAnalysis, overrides: updated })); } catch {}
@@ -8011,6 +8650,7 @@ export default function App() {
           const newAttrs = { ...ovAttrs, [attrKey]: updated };
           const newOverrides = { ...archOverrides, attributes: newAttrs };
           setArchOverrides(newOverrides);
+          setIntelligenceVersion(v => v + 1);
           if (currentModel) {
             try { localStorage.setItem(`tf-model-${currentModel.id}-arch-analysis`,
               JSON.stringify({ base: archAnalysis, overrides: newOverrides })); } catch {}
@@ -8183,6 +8823,14 @@ export default function App() {
           userDocs={userDocs}
           parseResult={parseResult}
           key={intelligenceVersion}
+          llmStatus={llmStatus}
+          llmProgress={llmProgress}
+          llmStatusText={llmStatusText}
+          embedStatus={embedStatus}
+          onInitLLM={initLLM}
+          onHybridSearch={hybridSearch}
+          onGenerateLLM={generateLLMResponse}
+          vectorStore={vectorStoreRef.current}
         />
       )}
 

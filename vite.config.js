@@ -7,4 +7,15 @@ export default defineConfig({
     port: 5173,
     host: "127.0.0.1",
   },
+  worker: {
+    format: "es",
+  },
+  optimizeDeps: {
+    exclude: ["@mlc-ai/web-llm", "@huggingface/transformers"],
+  },
+  build: {
+    rollupOptions: {
+      external: [],
+    },
+  },
 });
