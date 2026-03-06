@@ -1,8 +1,24 @@
 /**
  * src/lib/ingestion/PresentationExtractor.js
- * Extracts text from PPTX files by parsing the ZIP/XML structure directly.
- * No external dependency for basic text extraction.
+ * Extracts text from PPTX files by parsing the ZIP/XML structure.
+ * Load order: (1) npm jszip, (2) esm.sh CDN fallback.
  */
+
+const JSZIP_CDN = 'https://esm.sh/jszip@3.10.1';
+
+async function getJSZip() {
+  // 1. Try installed npm package
+  try {
+    return (await import(/* @vite-ignore */ 'jszip')).default;
+  } catch {
+    // 2. CDN ESM fallback
+    try {
+      return (await import(/* @vite-ignore */ JSZIP_CDN)).default;
+    } catch {
+      throw new Error('PPTX extraction unavailable. Install jszip or check internet access.');
+    }
+  }
+}
 
 /**
  * Extract text from a PPTX file.
@@ -12,13 +28,12 @@
 export async function extractPPTX(input) {
   const arrayBuffer = input instanceof ArrayBuffer ? input : await input.arrayBuffer();
 
-  // Try JSZip if available
   let zip;
   try {
-    const JSZip = (await import(/* @vite-ignore */ 'jszip')).default;
+    const JSZip = await getJSZip();
     zip = await JSZip.loadAsync(arrayBuffer);
-  } catch {
-    return { text: '[PPTX extraction requires: npm install jszip]', metadata: { type: 'pptx' }, tables: [], codeBlocks: [] };
+  } catch (err) {
+    return { text: `[PPTX extraction failed: ${err.message}]`, metadata: { type: 'pptx' }, tables: [], codeBlocks: [] };
   }
 
   // Find slide XML files (ppt/slides/slide*.xml)
