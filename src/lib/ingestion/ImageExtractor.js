@@ -9,7 +9,7 @@ let tesseractWorker = null;
 async function getTesseract() {
   if (!tesseractWorker) {
     try {
-      const { createWorker } = await import('tesseract.js');
+      const { createWorker } = await import(/* @vite-ignore */ 'tesseract.js');
       tesseractWorker = await createWorker('eng');
     } catch {
       throw new Error('tesseract.js not installed. Run: npm install tesseract.js');

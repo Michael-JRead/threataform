@@ -8,7 +8,7 @@ let mammothMod = null;
 async function getMammoth() {
   if (!mammothMod) {
     try {
-      mammothMod = await import('mammoth');
+      mammothMod = await import(/* @vite-ignore */ 'mammoth');
     } catch {
       throw new Error('mammoth.js not installed. Run: npm install mammoth');
     }

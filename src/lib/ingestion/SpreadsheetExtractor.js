@@ -8,7 +8,7 @@ let XLSX = null;
 async function getXLSX() {
   if (!XLSX) {
     try {
-      XLSX = await import('xlsx');
+      XLSX = await import(/* @vite-ignore */ 'xlsx');
     } catch {
       throw new Error('SheetJS not installed. Run: npm install xlsx');
     }

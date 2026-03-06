@@ -15,7 +15,7 @@ export async function extractPPTX(input) {
   // Try JSZip if available
   let zip;
   try {
-    const JSZip = (await import('jszip')).default;
+    const JSZip = (await import(/* @vite-ignore */ 'jszip')).default;
     zip = await JSZip.loadAsync(arrayBuffer);
   } catch {
     return { text: '[PPTX extraction requires: npm install jszip]', metadata: { type: 'pptx' }, tables: [], codeBlocks: [] };

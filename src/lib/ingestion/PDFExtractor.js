@@ -8,7 +8,7 @@ let pdfjsLib = null;
 async function getPDFJS() {
   if (!pdfjsLib) {
     try {
-      pdfjsLib = await import('pdfjs-dist');
+      pdfjsLib = await import(/* @vite-ignore */ 'pdfjs-dist');
       // Required worker setup for pdfjs in browser
       if (typeof window !== 'undefined' && !pdfjsLib.GlobalWorkerOptions?.workerSrc) {
         pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
