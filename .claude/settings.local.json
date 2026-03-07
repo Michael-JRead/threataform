@@ -94,7 +94,19 @@
       "Bash(powershell -Command \"Get-Process | Where-Object { $_.Path -like ''*git*'' -or $_.Name -like ''*git*'' } | Select-Object Id, Name, Path\")",
       "Bash(git rm --cached .claude/settings.local.json)",
       "Bash(powershell -Command \":*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(GIT_INDEX_FILE=/tmp/clean_index git rm -r --cached node_modules/ dist/)",
+      "Bash(GIT_INDEX_FILE=/tmp/clean_index git ls-files node_modules/ dist/)",
+      "Bash(node --input-type=module --eval \"import\\(''./src/lib/iac/CFNParser.js''\\)\")",
+      "Bash(node --input-type=module --eval \"import\\(''./src/lib/iac/OrgTreeBuilder.js''\\)\")",
+      "Bash(node --input-type=module --eval \"import\\(''./src/lib/iac/PolicyEvaluator.js''\\)\")",
+      "Bash(Get-Content \"C:\\\\Users\\\\mjrma\\\\Downloads\\\\threataform\\\\test-data\\\\main.tf\" -Raw)",
+      "Bash(Out-String)",
+      "Bash(Measure-Object -Character)",
+      "Bash(Select-Object -ExpandProperty Characters)",
+      "Bash(python -c \":*)",
+      "Bash(npx vite build --logLevel error)",
+      "Bash(node --input-type=module --eval \"import\\(''./terraform-enterprise-intelligence.jsx''\\)\")"
     ]
   }
 }

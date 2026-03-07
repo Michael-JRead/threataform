@@ -1,19 +1,29 @@
 /**
  * src/lib/ingestion/ImageExtractor.js
- * OCR for images using Tesseract.js (lazy-loaded).
- * Only loaded when the user uploads an image file.
+ * OCR for images using Tesseract.js.
+ * Load order: (1) npm tesseract.js, (2) esm.sh CDN fallback.
+ * Note: CDN fallback downloads ~10MB language model on first use.
  */
+
+const TESSERACT_CDN = 'https://esm.sh/tesseract.js@5.0.4';
 
 let tesseractWorker = null;
 
 async function getTesseract() {
   if (!tesseractWorker) {
+    let createWorker;
+    // 1. Try installed npm package
     try {
-      const { createWorker } = await import('tesseract.js');
-      tesseractWorker = await createWorker('eng');
+      ({ createWorker } = await import(/* @vite-ignore */ 'tesseract.js'));
     } catch {
-      throw new Error('tesseract.js not installed. Run: npm install tesseract.js');
+      // 2. CDN ESM fallback
+      try {
+        ({ createWorker } = await import(/* @vite-ignore */ TESSERACT_CDN));
+      } catch {
+        throw new Error('OCR unavailable. Install tesseract.js or check internet access.');
+      }
     }
+    tesseractWorker = await createWorker('eng');
   }
   return tesseractWorker;
 }
@@ -54,7 +64,6 @@ export async function extractImage(input) {
 }
 
 function _detectTableRows(blocks) {
-  // Simplified: group words by approximate y-coordinate
   const byY = new Map();
   for (const block of blocks) {
     for (const par of block.paragraphs ?? []) {

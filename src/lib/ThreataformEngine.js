@@ -284,8 +284,8 @@ class ThreataformEngine {
     if (!query || this._bm25.size === 0) return messages;
 
     try {
-      // BM25 retrieval only (model not used in context path to avoid re-entrance)
-      const bm25Results = this._bm25.search(query, 5);
+      // Fused BM25 + dense retrieval (search() falls back to BM25-only if model unavailable)
+      const bm25Results = await this.search(query, 5);
       if (!bm25Results.length) return messages;
 
       const context = packContext(bm25Results, 1200, 'Relevant Context from Uploaded Documents');

@@ -1,16 +1,25 @@
 /**
  * src/lib/ingestion/DocxExtractor.js
- * Extracts text from DOCX files using mammoth.js (lazy-loaded).
+ * Extracts text from DOCX files using mammoth.js.
+ * Load order: (1) npm mammoth, (2) esm.sh CDN fallback.
  */
+
+const MAMMOTH_CDN = 'https://esm.sh/mammoth@1.6.0';
 
 let mammothMod = null;
 
 async function getMammoth() {
   if (!mammothMod) {
+    // 1. Try installed npm package
     try {
-      mammothMod = await import('mammoth');
+      mammothMod = await import(/* @vite-ignore */ 'mammoth');
     } catch {
-      throw new Error('mammoth.js not installed. Run: npm install mammoth');
+      // 2. CDN ESM fallback
+      try {
+        mammothMod = await import(/* @vite-ignore */ MAMMOTH_CDN);
+      } catch {
+        throw new Error('DOCX extraction unavailable. Install mammoth or check internet access.');
+      }
     }
   }
   return mammothMod;

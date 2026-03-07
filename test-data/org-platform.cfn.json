@@ -1,0 +1,508 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Pave L1/L2 Platform - AWS Organizations, IAM Permission Boundaries, SCPs, and Platform Resources",
+  "Parameters": {
+    "OrganizationId": {
+      "Type": "String",
+      "Description": "AWS Organizations root organization ID"
+    },
+    "ManagementAccountId": {
+      "Type": "String",
+      "Description": "Management account ID"
+    }
+  },
+  "Resources": {
+
+    "SecurityOU": {
+      "Type": "AWS::Organizations::OrganizationalUnit",
+      "Properties": {
+        "Name": "Security",
+        "ParentId": { "Ref": "OrganizationId" },
+        "Tags": [{ "Key": "PaveLayer", "Value": "L0" }]
+      }
+    },
+
+    "WorkloadProdOU": {
+      "Type": "AWS::Organizations::OrganizationalUnit",
+      "Properties": {
+        "Name": "Workload-Production",
+        "ParentId": { "Ref": "OrganizationId" },
+        "Tags": [{ "Key": "PaveLayer", "Value": "L4" }]
+      }
+    },
+
+    "SharedServicesOU": {
+      "Type": "AWS::Organizations::OrganizationalUnit",
+      "Properties": {
+        "Name": "Shared-Services",
+        "ParentId": { "Ref": "OrganizationId" },
+        "Tags": [{ "Key": "PaveLayer", "Value": "L2" }]
+      }
+    },
+
+    "WorkloadProdAccount": {
+      "Type": "AWS::Organizations::Account",
+      "Properties": {
+        "AccountName": "workload-prod-01",
+        "Email": "workload-prod@example.com",
+        "ParentIds": [{ "Fn::GetAtt": ["WorkloadProdOU", "Id"] }],
+        "Tags": [
+          { "Key": "PaveLayer", "Value": "L4" },
+          { "Key": "Environment", "Value": "production" }
+        ]
+      }
+    },
+
+    "DenyRootActionsPolicy": {
+      "Type": "AWS::Organizations::Policy",
+      "Properties": {
+        "Name": "deny-root-actions",
+        "Description": "Deny all root account actions across the organization",
+        "Type": "SERVICE_CONTROL_POLICY",
+        "Content": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyRootUser",
+              "Effect": "Deny",
+              "Action": "*",
+              "Resource": "*",
+              "Condition": {
+                "StringLike": {
+                  "aws:PrincipalArn": ["arn:aws:iam::*:root"]
+                }
+              }
+            },
+            {
+              "Sid": "DenyDisablingCloudTrail",
+              "Effect": "Deny",
+              "Action": [
+                "cloudtrail:DeleteTrail",
+                "cloudtrail:StopLogging",
+                "cloudtrail:UpdateTrail"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Sid": "DenyLeavingOrg",
+              "Effect": "Deny",
+              "Action": "organizations:LeaveOrganization",
+              "Resource": "*"
+            }
+          ]
+        },
+        "Tags": [{ "Key": "PaveLayer", "Value": "L0" }]
+      }
+    },
+
+    "DenyUnauthorizedRegionsPolicy": {
+      "Type": "AWS::Organizations::Policy",
+      "Properties": {
+        "Name": "deny-unauthorized-regions",
+        "Description": "Restrict resource creation to approved AWS regions only",
+        "Type": "SERVICE_CONTROL_POLICY",
+        "Content": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyUnsupportedRegions",
+              "Effect": "Deny",
+              "NotAction": [
+                "iam:*",
+                "sts:*",
+                "organizations:*",
+                "support:*",
+                "cloudfront:*",
+                "route53:*",
+                "waf:*"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringNotIn": {
+                  "aws:RequestedRegion": ["us-east-1", "us-east-2", "us-west-2"]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+
+    "DenyPrivilegeEscalationPolicy": {
+      "Type": "AWS::Organizations::Policy",
+      "Properties": {
+        "Name": "deny-privilege-escalation",
+        "Description": "Prevent IAM privilege escalation paths",
+        "Type": "SERVICE_CONTROL_POLICY",
+        "Content": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyCreateRole",
+              "Effect": "Deny",
+              "Action": [
+                "iam:CreateRole",
+                "iam:AttachRolePolicy",
+                "iam:PutRolePolicy",
+                "iam:CreateUser",
+                "iam:AttachUserPolicy",
+                "iam:CreateAccessKey",
+                "iam:UpdateAssumeRolePolicy"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "ArnNotLike": {
+                  "aws:PrincipalArn": [
+                    { "Fn::Sub": "arn:aws:iam::${ManagementAccountId}:role/OrgAdmin" }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+
+    "RootScpAttachment": {
+      "Type": "AWS::Organizations::PolicyAttachment",
+      "Properties": {
+        "PolicyId": { "Fn::GetAtt": ["DenyRootActionsPolicy", "Id"] },
+        "TargetId": { "Ref": "OrganizationId" }
+      }
+    },
+
+    "PrivEscScpAttachment": {
+      "Type": "AWS::Organizations::PolicyAttachment",
+      "Properties": {
+        "PolicyId": { "Fn::GetAtt": ["DenyPrivilegeEscalationPolicy", "Id"] },
+        "TargetId": { "Fn::GetAtt": ["WorkloadProdOU", "Id"] }
+      }
+    },
+
+    "PlatformPermissionBoundary": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "ManagedPolicyName": "platform-permission-boundary",
+        "Description": "Permission boundary applied to all workload roles — enforced by pave L1 automation",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowCoreServices",
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+                "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey",
+                "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents",
+                "cloudwatch:PutMetricData",
+                "secretsmanager:GetSecretValue",
+                "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage",
+                "sns:Publish",
+                "ec2:DescribeInstances", "ec2:DescribeVpcs"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Sid": "DenyIAMEscalation",
+              "Effect": "Deny",
+              "Action": [
+                "iam:CreateRole",
+                "iam:DeleteRolePolicy",
+                "iam:AttachRolePolicy",
+                "iam:DetachRolePolicy",
+                "iam:PutRolePolicy",
+                "iam:CreateUser",
+                "iam:CreateAccessKey",
+                "iam:CreatePolicy",
+                "iam:SetDefaultPolicyVersion",
+                "iam:UpdateAssumeRolePolicy",
+                "sts:AssumeRole"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Sid": "DenyOrganizationsWrite",
+              "Effect": "Deny",
+              "Action": "organizations:*",
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+
+    "WorkloadDeployRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "WorkloadDeployRole",
+        "PermissionsBoundary": { "Ref": "PlatformPermissionBoundary" },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "codepipeline.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "DeployPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["cloudformation:CreateStack", "cloudformation:UpdateStack", "cloudformation:DeleteStack", "cloudformation:DescribeStacks"],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:GetObject", "s3:PutObject"],
+                  "Resource": "arn:aws:s3:::deploy-artifacts-*/*"
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          { "Key": "PaveLayer", "Value": "L1" },
+          { "Key": "ManagedBy", "Value": "platform-team" }
+        ]
+      }
+    },
+
+    "SecurityAuditRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "SecurityAuditRole",
+        "PermissionsBoundary": { "Ref": "PlatformPermissionBoundary" },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": { "Fn::Sub": "arn:aws:iam::${ManagementAccountId}:role/SecurityHub" }
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "sts:ExternalId": "SecurityAuditExternalId"
+                }
+              }
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/SecurityAudit",
+          "arn:aws:iam::aws:policy/ReadOnlyAccess"
+        ]
+      }
+    },
+
+    "OverprivilegedRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "OverprivilegedAdminRole",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "AdminPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "*",
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "AppDataBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": { "Fn::Sub": "app-data-${AWS::AccountId}" },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "aws:kms",
+                "KMSMasterKeyID": { "Ref": "PlatformKMSKey" }
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "LoggingConfiguration": {
+          "DestinationBucketName": { "Ref": "LogsBucket" },
+          "LogFilePrefix": "app-data-logs/"
+        },
+        "Tags": [
+          { "Key": "DataClassification", "Value": "Confidential" },
+          { "Key": "PaveLayer", "Value": "L4" }
+        ]
+      }
+    },
+
+    "PublicAssetsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": { "Fn::Sub": "public-assets-${AWS::AccountId}" },
+        "Tags": [{ "Key": "Visibility", "Value": "public" }]
+      }
+    },
+
+    "LogsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": { "Fn::Sub": "org-logs-${AWS::AccountId}" },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        }
+      }
+    },
+
+    "PlatformKMSKey": {
+      "Type": "AWS::KMS::Key",
+      "Properties": {
+        "Description": "Platform-wide encryption key — managed by L1 pave",
+        "EnableKeyRotation": true,
+        "MultiRegion": false,
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "Enable IAM User Permissions",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": { "Fn::Sub": "arn:aws:iam::${AWS::AccountId}:root" }
+              },
+              "Action": "kms:*",
+              "Resource": "*"
+            }
+          ]
+        },
+        "Tags": [
+          { "Key": "PaveLayer", "Value": "L1" },
+          { "Key": "ManagedBy", "Value": "platform-team" }
+        ]
+      }
+    },
+
+    "UnrotatedKMSKey": {
+      "Type": "AWS::KMS::Key",
+      "Properties": {
+        "Description": "Legacy key — rotation disabled",
+        "EnableKeyRotation": false,
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": { "Fn::Sub": "arn:aws:iam::${AWS::AccountId}:root" }
+              },
+              "Action": "kms:*",
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+
+    "AppDatabase": {
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {
+        "DBInstanceIdentifier": "app-database",
+        "DBInstanceClass": "db.t3.medium",
+        "Engine": "mysql",
+        "EngineVersion": "8.0.33",
+        "MasterUsername": "admin",
+        "MasterUserPassword": { "Fn::Sub": "{{resolve:secretsmanager:db-password}}" },
+        "AllocatedStorage": "100",
+        "StorageEncrypted": true,
+        "KmsKeyId": { "Ref": "PlatformKMSKey" },
+        "MultiAZ": true,
+        "DeletionProtection": true,
+        "BackupRetentionPeriod": 30,
+        "EnableCloudwatchLogsExports": ["error", "general", "slowquery"],
+        "VPCSecurityGroups": [],
+        "Tags": [
+          { "Key": "PaveLayer", "Value": "L4" },
+          { "Key": "DataClassification", "Value": "Restricted" }
+        ]
+      }
+    },
+
+    "InsecureDatabase": {
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {
+        "DBInstanceIdentifier": "legacy-database",
+        "DBInstanceClass": "db.t3.small",
+        "Engine": "mysql",
+        "EngineVersion": "5.7",
+        "MasterUsername": "root",
+        "MasterUserPassword": "changeme",
+        "AllocatedStorage": "20",
+        "StorageEncrypted": false,
+        "PubliclyAccessible": true,
+        "MultiAZ": false,
+        "DeletionProtection": false
+      }
+    }
+  },
+
+  "Outputs": {
+    "PlatformKMSKeyId": {
+      "Description": "Platform KMS Key ID",
+      "Value": { "Ref": "PlatformKMSKey" },
+      "Export": { "Name": "PlatformKMSKeyId" }
+    },
+    "PermissionBoundaryArn": {
+      "Description": "Platform permission boundary ARN",
+      "Value": { "Ref": "PlatformPermissionBoundary" },
+      "Export": { "Name": "PlatformPermissionBoundaryArn" }
+    }
+  }
+}

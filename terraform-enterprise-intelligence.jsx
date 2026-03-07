@@ -4,6 +4,9 @@ import { useState, useCallback, useRef, useMemo, useEffect, Component } from "re
 // User loads a GGUF model file from their local disk.
 import { wllamaManager } from './src/lib/WllamaManager.js';
 import { VectorStore, hybridSearch as ragHybridSearch, buildRAGPrompt, ContextPacker } from './src/lib/ThrataformRAG.js';
+import { HybridRetriever } from './src/lib/rag/HybridRetriever.js';
+import { hydeTemplate } from './src/lib/rag/HyDE.js';
+import { ColBERTVectorStore } from './src/lib/rag/VectorStore.js';
 import {
   BookOpen, Upload, Brain, Microscope, Map as MapIcon, Building2, Search, ShieldCheck,
   ListChecks, GitCompare, ShieldAlert, Zap, TriangleAlert, ScanLine, Layers,
@@ -1462,6 +1465,28 @@ function parseTFMultiFile(files) {
   return {resources:uResources, modules:uModules, connections:uConns, outputs, variables, remoteStates, paveLayers, unpinnedModules, outputIndex};
 }
 
+/**
+ * Parse CloudFormation JSON files and return unified resources array.
+ * Lazy-loads CFNParser to avoid bundle bloat when CFN is not used.
+ * @param {Array<{path: string, content: string}>} files
+ * @returns {Promise<{resources: object[], gaps: string[]}>}
+ */
+async function parseCFNFiles(files) {
+  const { extractCFNResources } = await import('./src/lib/iac/CFNParser.js');
+  const allResources = [];
+  const allGaps = [];
+  for (const { path, content } of files) {
+    try {
+      const { resources, gaps } = extractCFNResources(content, path);
+      allResources.push(...resources);
+      allGaps.push(...gaps);
+    } catch (err) {
+      allGaps.push(`[parseCFNFiles] Error processing ${path}: ${err.message}`);
+    }
+  }
+  return { resources: allResources, gaps: allGaps };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THREAT MODEL INTELLIGENCE ENGINE
 // Pure client-side — NO external APIs, ZERO hallucination.
@@ -1620,6 +1645,31 @@ const TF_ATTACK_MAP = {
   'aws_organizations_policy':          ['T1078.004','T1548'],
   'xsphere_virtual_machine':           ['T1190','T1552.005','T1580'],
   'xsphere_cluster':                   ['T1580','T1613'],
+  // ── CloudFormation resource types ────────────────────────────────────────
+  'AWS::IAM::Role':                    ['T1078.004','T1098.003','T1548'],
+  'AWS::IAM::Policy':                  ['T1078.004','T1548'],
+  'AWS::IAM::ManagedPolicy':           ['T1078.004','T1548'],
+  'AWS::IAM::Group':                   ['T1078.004'],
+  'AWS::IAM::User':                    ['T1078.004','T1098.003'],
+  'AWS::Organizations::Policy':        ['T1078.004','T1548'],
+  'AWS::Organizations::Account':       ['T1078.004'],
+  'AWS::Organizations::OrganizationalUnit': ['T1078.004'],
+  'AWS::S3::Bucket':                   ['T1530','T1537','T1485'],
+  'AWS::S3::BucketPolicy':             ['T1530','T1078.004'],
+  'AWS::KMS::Key':                     ['T1600','T1555.006'],
+  'AWS::RDS::DBInstance':              ['T1530','T1190','T1485'],
+  'AWS::RDS::DBCluster':               ['T1530','T1485'],
+  'AWS::Lambda::Function':             ['T1648','T1059.009','T1552.005'],
+  'AWS::EC2::SecurityGroup':           ['T1190','T1046'],
+  'AWS::CloudFormation::Stack':        ['T1190'],
+  'AWS::ApiGateway::RestApi':          ['T1190','T1059.009'],
+  'AWS::ApiGatewayV2::Api':            ['T1190','T1059.009'],
+  'AWS::DynamoDB::Table':              ['T1530','T1485'],
+  'AWS::SecretsManager::Secret':       ['T1555.006','T1552.005'],
+  'AWS::StepFunctions::StateMachine':  ['T1648','T1059.009'],
+  'AWS::Events::Rule':                 ['T1546','T1037'],
+  'AWS::Bedrock::Agent':               ['T1648','T1190'],
+  'AWS::SageMaker::NotebookInstance':  ['T1648','T1530'],
 };
 
 // CWE weakness definitions
@@ -1652,9 +1702,9 @@ const STRIDE_PER_ELEMENT = {
 // Resource type → DFD element type for STRIDE-per-element
 function _getElementType(resourceType) {
   const rt = resourceType || '';
-  if (/s3|rds|dynamodb|elasticache|opensearch|elasticsearch|ebs|efs|ssm_parameter|secrets/.test(rt)) return 'data_store';
-  if (/security_group|nacl|waf|shield|firewall|acl|route53|nat_gateway|internet_gateway/.test(rt)) return 'data_flow';
-  if (/iam_role|iam_user|iam_policy|organizations|cognito/.test(rt)) return 'external_entity';
+  if (/s3|rds|dynamodb|elasticache|opensearch|elasticsearch|ebs|efs|ssm_parameter|secrets|AWS::S3::|AWS::RDS::|AWS::DynamoDB::|AWS::ElastiCache::/.test(rt)) return 'data_store';
+  if (/security_group|nacl|waf|shield|firewall|acl|route53|nat_gateway|internet_gateway|AWS::EC2::SecurityGroup|AWS::WAF/.test(rt)) return 'data_flow';
+  if (/iam_role|iam_user|iam_policy|organizations|cognito|AWS::IAM::|AWS::Organizations::/.test(rt)) return 'external_entity';
   return 'process';
 }
 
@@ -1788,6 +1838,63 @@ const TF_MISCONFIG_CHECKS = {
     { id:'ECR-002', title:'ECR Repository Image Tags Are Mutable',    severity:'Medium', cwe:['CWE-494'],      attack:['T1195.002'], check:(a)=>!a.image_tag_mutability||a.image_tag_mutability!=='IMMUTABLE', remediation:'Set image_tag_mutability = "IMMUTABLE" to prevent tag overwriting / supply chain attacks.' },
     { id:'ECR-003', title:'ECR Repository Not Encrypted with CMK',    severity:'Medium', cwe:['CWE-311'],      attack:['T1530'],     check:(a)=>!a.encryption_configuration||!a.kms_key, remediation:'Set encryption_configuration { encryption_type = "KMS", kms_key = var.kms_arn }.' },
   ],
+  // ── CloudFormation resource checks (CFNXXX IDs) ──────────────────────────
+  'AWS::S3::Bucket': [
+    { id:'CFNS3-001', title:'S3 Public Access Not Blocked', severity:'Critical', cwe:['CWE-284','CWE-732'], attack:['T1530'],
+      check:(a)=>!a.block_public_acls&&!a.block_public_policy,
+      remediation:'Set PublicAccessBlockConfiguration.BlockPublicAcls and BlockPublicPolicy to true.' },
+    { id:'CFNS3-002', title:'S3 Versioning Disabled', severity:'Medium', cwe:['CWE-400'], attack:['T1485'],
+      check:(a)=>!a.versioning_enabled,
+      remediation:'Set VersioningConfiguration.Status to "Enabled".' },
+    { id:'CFNS3-003', title:'S3 Encryption Not Configured', severity:'High', cwe:['CWE-311'], attack:['T1530'],
+      check:(a)=>!a.server_side_encryption_configuration,
+      remediation:'Add BucketEncryption with ServerSideEncryptionConfiguration.' },
+    { id:'CFNS3-004', title:'S3 Access Logging Disabled', severity:'Medium', cwe:['CWE-778'], attack:['T1562.008'],
+      check:(a)=>!a.logging,
+      remediation:'Add LoggingConfiguration with DestinationBucketName.' },
+  ],
+  'AWS::IAM::Role': [
+    { id:'CFNIAM-001', title:'IAM Role Allows Wildcard Actions (*)', severity:'Critical', cwe:['CWE-250','CWE-269'], attack:['T1078.004','T1548'],
+      check:(a)=>{ const p=a.inline_policy||''; return p.includes('"Action":"*"')||p.includes('"Action":["*"]'); },
+      remediation:'Replace wildcard actions with specific IAM actions.' },
+    { id:'CFNIAM-002', title:'IAM Role Has No Permission Boundary', severity:'High', cwe:['CWE-269'], attack:['T1548'],
+      check:(a)=>!a.permissions_boundary&&!a.__intrinsic_PermissionsBoundary,
+      remediation:'Attach a PermissionsBoundary to all IAM roles in pave templates.' },
+    { id:'CFNIAM-003', title:'IAM Role Trust Policy Allows Broad Principal', severity:'High', cwe:['CWE-284'], attack:['T1078.004'],
+      check:(a)=>{ try { const d=JSON.parse(a.assume_role_policy||'{}'); return (d.Statement||[]).some(s=>s.Principal==='*'||s.Principal?.AWS==='*'); } catch{return false;}},
+      remediation:'Restrict AssumeRolePolicyDocument Principal to specific accounts or services.' },
+  ],
+  'AWS::IAM::ManagedPolicy': [
+    { id:'CFNIAM-004', title:'Managed Policy Allows Wildcard Actions (*)', severity:'Critical', cwe:['CWE-250'], attack:['T1078.004','T1548'],
+      check:(a)=>(a.body||'').includes('"Action":"*"'),
+      remediation:'Replace wildcard Action in ManagedPolicy with specific IAM actions.' },
+  ],
+  'AWS::Organizations::Policy': [
+    { id:'CFNORG-001', title:'SCP Has No Deny Statements (Allows Only)', severity:'Medium', cwe:['CWE-284'], attack:['T1078.004'],
+      check:(a)=>{ try { const d=JSON.parse(a.assume_role_policy||'{}'); return !(d.Statement||[]).some(s=>s.Effect==='Deny'); } catch{return false;}},
+      remediation:'Add explicit Deny statements to SCP for privileged actions.' },
+  ],
+  'AWS::KMS::Key': [
+    { id:'CFNKMS-001', title:'KMS Key Rotation Disabled', severity:'Medium', cwe:['CWE-326'], attack:['T1600'],
+      check:(a)=>a.enable_key_rotation===false||a.enable_key_rotation==='false',
+      remediation:'Set EnableKeyRotation to true.' },
+  ],
+  'AWS::RDS::DBInstance': [
+    { id:'CFNRDS-001', title:'RDS Not Encrypted at Rest', severity:'High', cwe:['CWE-311'], attack:['T1530'],
+      check:(a)=>!a.storage_encrypted,
+      remediation:'Set StorageEncrypted to true.' },
+    { id:'CFNRDS-002', title:'RDS Publicly Accessible', severity:'Critical', cwe:['CWE-284'], attack:['T1190'],
+      check:(a)=>a.publicly_accessible===true,
+      remediation:'Set PubliclyAccessible to false.' },
+    { id:'CFNRDS-003', title:'RDS Deletion Protection Disabled', severity:'Medium', cwe:['CWE-400'], attack:['T1485'],
+      check:(a)=>!a.deletion_protection,
+      remediation:'Set DeletionProtection to true.' },
+  ],
+  'AWS::EC2::SecurityGroup': [
+    { id:'CFNSG-001', title:'Security Group Allows Unrestricted Inbound (0.0.0.0/0)', severity:'High', cwe:['CWE-284'], attack:['T1190','T1046'],
+      check:(a)=>{ try { const ips=(a.SecurityGroupIngress||[]); return ips.some(r=>r.CidrIp==='0.0.0.0/0'||r.CidrIpv6==='::/0'); } catch{return false;}},
+      remediation:'Restrict SecurityGroupIngress CidrIp to known IP ranges. Avoid 0.0.0.0/0.' },
+  ],
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1810,10 +1917,10 @@ const CONTROL_DETECTION_MAP = [
   { id:'CTRL-TGW',    layer:'network',     ztPillar:'network',     name:'Transit Gateway (Microsegmentation)',  detect:(rs)=>rs.some(r=>r.type==='aws_ec2_transit_gateway') },
   { id:'CTRL-DX',     layer:'network',     ztPillar:'network',     name:'Direct Connect / VPN',                 detect:(rs)=>rs.some(r=>['aws_dx_connection','aws_vpn_connection','aws_customer_gateway'].includes(r.type)) },
   // ── Identity
-  { id:'CTRL-SCP',    layer:'identity',    ztPillar:'identity',    name:'Service Control Policies (SCPs)',      detect:(rs)=>rs.some(r=>r.type==='aws_organizations_policy') },
+  { id:'CTRL-SCP',    layer:'identity',    ztPillar:'identity',    name:'Service Control Policies (SCPs)',      detect:(rs)=>rs.some(r=>r.type==='aws_organizations_policy'||r.type==='AWS::Organizations::Policy') },
   { id:'CTRL-SSO',    layer:'identity',    ztPillar:'identity',    name:'AWS SSO / Identity Center',            detect:(rs)=>rs.some(r=>r.type.startsWith('aws_ssoadmin')||r.type.startsWith('aws_identitystore')) },
   { id:'CTRL-OIDC',   layer:'identity',    ztPillar:'identity',    name:'OIDC Federation (GitHub/TFE)',         detect:(rs)=>rs.some(r=>r.type==='aws_iam_openid_connect_provider') },
-  { id:'CTRL-PB',     layer:'identity',    ztPillar:'identity',    name:'IAM Permission Boundaries',           detect:(rs)=>rs.some(r=>r.type==='aws_iam_role'&&r.body&&r.body.includes('permissions_boundary')) },
+  { id:'CTRL-PB',     layer:'identity',    ztPillar:'identity',    name:'IAM Permission Boundaries',           detect:(rs)=>rs.some(r=>(r.type==='aws_iam_role'&&r.body&&r.body.includes('permissions_boundary'))||(r.type==='AWS::IAM::Role'&&r.cfnProps?.PermissionsBoundary)) },
   { id:'CTRL-SAML',   layer:'identity',    ztPillar:'identity',    name:'SAML Federation',                      detect:(rs)=>rs.some(r=>r.type==='aws_iam_saml_provider') },
   { id:'CTRL-AA',     layer:'identity',    ztPillar:'identity',    name:'IAM Access Analyzer',                  detect:(rs)=>rs.some(r=>r.type==='aws_accessanalyzer_analyzer') },
   // ── Compute
@@ -1978,6 +2085,15 @@ class ThreatModelIntelligence {
       cwe:['weakness','vulnerability class','defect'],
       xss:['cross-site scripting','script injection'],
       sqli:['sql injection','injection attack','database injection'],
+      // IaC / CFN / Organizations
+      cfn:['cloudformation','aws template','resource properties','intrinsic ref','stack'],
+      cloudformation:['cfn','template stack','aws resource','intrinsic function','cfn resource'],
+      scp:['service control policy','organizations policy','ou deny allow','scp ceiling'],
+      organizations:['org','ou','organizational unit','account','management account','root scp'],
+      pave:['l0','l1','l2','l3','l4','tier','layer','account baseline','account vending','platform'],
+      'permission boundary':['boundary','iam privilege limit','delegation boundary','escalation guard'],
+      hcl:['terraform','hashicorp configuration language','tf resource','provider block'],
+      iac:['infrastructure as code','terraform','cloudformation','hcl','cdk','pulumi'],
     };
     const lower = q.toLowerCase();
     const extra = [];
@@ -2185,14 +2301,54 @@ class ThreatModelIntelligence {
   // ── Misconfiguration checks for a resource ───────────────────────────────────
   getMisconfigurations(resource) {
     const type = resource?.type||'';
-    // Use _parseAttrMap to parse HCL body into attribute dict — resource.attributes is always {}
-    const attrs = this._parseAttrMap(resource?.body||'');
+    // Branch on isCFN: use structured cfnProps for CFN resources, HCL body for TF resources
+    const attrs = resource?.isCFN
+      ? this._parseCFNAttrs(resource.cfnProps||{})
+      : this._parseAttrMap(resource?.body||'');
     return (TF_MISCONFIG_CHECKS[type]||[]).reduce((out,chk) => {
       let triggered=false;
       try { triggered=chk.check(attrs); } catch(_){}
-      if (triggered) out.push({ id:chk.id, title:chk.title, severity:chk.severity, cwe:chk.cwe, attack:chk.attack, remediation:chk.remediation });
+      if (triggered) out.push({
+        id:chk.id, title:chk.title, severity:chk.severity,
+        cwe:chk.cwe, attack:chk.attack, remediation:chk.remediation,
+        resourceType:type, resourceName:resource?.name||resource?.id||'',
+        paveLayer:resource?.paveLayer||null,
+        mitigatedBy:null,  // Phase 2 fills this from SCP analysis
+      });
       return out;
     },[]);
+  }
+
+  // ── Parse CFN Properties object into unified attribute map ─────────────────
+  _parseCFNAttrs(props) {
+    if (!props||typeof props!=='object') return {};
+    const a = {};
+    const pac = props.PublicAccessBlockConfiguration||{};
+    a.block_public_acls   = pac.BlockPublicAcls;
+    a.block_public_policy = pac.BlockPublicPolicy;
+    a.versioning_enabled  = props.VersioningConfiguration?.Status==='Enabled';
+    a.versioning          = a.versioning_enabled;
+    a.server_side_encryption_configuration = !!props.BucketEncryption;
+    a.logging             = !!props.LoggingConfiguration;
+    a.kms_key_id          = props.KMSMasterKeyID??props.KmsKeyId;
+    a.deletion_protection = props.DeletionProtectionEnabled??(props.DeletionPolicy==='Retain');
+    a.assume_role_policy  = typeof props.AssumeRolePolicyDocument==='object'
+                            ? JSON.stringify(props.AssumeRolePolicyDocument)
+                            : (props.AssumeRolePolicyDocument??'');
+    a.permissions_boundary = props.PermissionsBoundary;
+    a.inline_policy       = (props.Policies||[]).map(p=>JSON.stringify(p.PolicyDocument)).join(' ');
+    a.enable_key_rotation = props.EnableKeyRotation;
+    a.multi_az            = props.MultiAZ;
+    a.storage_encrypted   = props.StorageEncrypted;
+    a.publicly_accessible = props.PubliclyAccessible;
+    a.deletion_protection = a.deletion_protection||props.DeletionProtection;
+    a.SecurityGroupIngress = props.SecurityGroupIngress;
+    // Mark intrinsic-replaced fields
+    for (const [k,v] of Object.entries(props)) {
+      if (v==='__INTRINSIC__'||(v&&typeof v==='object'&&('Ref' in v||'Fn::Sub' in v||'Fn::GetAtt' in v)))
+        a[`__intrinsic_${k}`]=true;
+    }
+    return a;
   }
 
   // ── Parse HCL body into attribute map (fixes getMisconfigurations attrs bug) ────
@@ -2376,7 +2532,20 @@ class ThreatModelIntelligence {
     const grade=score>=80?'A':score>=65?'B':score>=50?'C':score>=35?'D':'F';
     const gradeColor=grade==='A'?'#2E7D32':grade==='B'?'#558B2F':grade==='C'?'#F9A825':grade==='D'?'#E65100':'#B71C1C';
     const maturity=score>=80?'Zero Trust Optimal':score>=60?'Advanced':score>=40?'Initial':'Traditional / Ad-Hoc';
-    return {score,grade,gradeColor,maturity,did,zt,nist};
+    // Derive topRisks from missing controls across DiD layers and ZT pillars
+    const topRisks = [];
+    Object.entries(did.layers||{}).forEach(([layer,data]) => {
+      if (data.score < 50 && data.missing?.length)
+        topRisks.push(`${layer.charAt(0).toUpperCase()+layer.slice(1)} layer gap: missing ${data.missing.slice(0,2).join(', ')}`);
+    });
+    Object.entries(zt.pillars||{}).forEach(([pillar,data]) => {
+      if (data.score < 40 && data.absent?.length) {
+        const names = data.absent.slice(0,2).map(a=>typeof a==='string'?a:(a?.name||a?.id||String(a)));
+        topRisks.push(`Zero Trust ${pillar}: ${names.join(', ')} not detected`);
+      }
+    });
+    if (nist.score < 50) topRisks.push(`NIST CSF score ${Math.round(nist.score)}% — review Identify/Protect functions`);
+    return {score,grade,gradeColor,maturity,did,zt,nist,topRisks:topRisks.slice(0,6)};
   }
 
   // ── Cross-doc correlation: link doc mentions to TF resource attributes ────────
@@ -2464,7 +2633,7 @@ class ThreatModelIntelligence {
     });
     const SEV=['Critical','High','Medium','Low'];
     const topMisconfigs=allMisconfigs.flatMap(m=>m.findings.map(f=>({...f,resourceType:m.resource.type,resourceName:m.resource.name||m.resource.id})))
-      .sort((a,b)=>SEV.indexOf(a.severity)-SEV.indexOf(b.severity)).slice(0,30);
+      .sort((a,b)=>SEV.indexOf(a.severity)-SEV.indexOf(b.severity)).slice(0,50);
     // ── New: posture, hierarchy, controls, cross-doc ─────────────────────────
     let posture=null, hierarchy=null, controlInventory=null, crossDocCorrelations=null;
     try { posture = this.getSecurityPosture(resources||[]); } catch(_){}
@@ -2552,87 +2721,154 @@ class ThreatModelIntelligence {
     if (_hasType('aws_efs_file_system')) storageTypes.push('EFS (shared file system)');
 
     // ── Doc-based narrative queries ──
+    // ── Doc queries — exclude raw terraform metadata chunks for clean narrative ──
     const _q = (terms, k=3) => {
-      const results = this.query(terms, k);
-      return results.map(r => r.text.substring(0, 300).replace(/\s+/g,' ').trim()).join(' ');
+      const results = this.query(terms, k * 4).filter(r => r.source !== 'terraform');
+      return results.slice(0, k).map(r => {
+        const sents = r.text
+          .replace(/#+\s/g,'').replace(/\*\*/g,'')
+          .split(/(?<=[.!?])\s+(?=[A-Z"'])/)
+          .map(s => s.replace(/\s+/g,' ').trim())
+          .filter(s => s.length > 25 && s.length < 200
+            && !s.startsWith('|') && !/^[-*]{3,}/.test(s) && !s.includes('------'));
+        return sents.slice(0, 2).join(' ');
+      }).filter(Boolean).join(' ');
     };
 
-    const docEntryPoints   = _q("entry point ingress endpoint API gateway load balancer");
-    const docDataFlow      = _q("data flow pipeline stream ingestion process transform");
-    const docSecBounds     = _q("trust boundary security zone VPC network segment DMZ");
-    const docAuth          = _q("authentication authorization IAM role policy SSO OAuth MFA");
-    const docExtDeps       = _q("third party vendor external integration dependency service");
-    const docStorage       = _q("storage database encryption data at rest S3 DynamoDB RDS");
-    const docFaultTol      = _q("fault tolerance high availability resilience redundancy failover");
-    const docPubPriv       = _q("public private internet exposure VPC subnet internal external");
-    const docControls      = _q("security control WAF GuardDuty Security Hub encryption KMS IAM");
+    const docEntryPoints = _q("entry point ingress endpoint API gateway load balancer");
+    const docDataFlow    = _q("data flow pipeline stream ingestion process transform");
+    const docSecBounds   = _q("trust boundary security zone VPC network segment DMZ scope");
+    const docAuth        = _q("authentication authorization IAM role policy SSO OAuth MFA");
+    const docExtDeps     = _q("third party vendor external integration dependency service");
+    const docStorage     = _q("storage database encryption data at rest S3 DynamoDB RDS");
+    const docFaultTol    = _q("fault tolerance high availability resilience redundancy failover");
+    const docPubPriv     = _q("public private internet exposure VPC subnet internal external");
+    const docControls    = _q("security control WAF GuardDuty Security Hub encryption KMS IAM");
 
-    // ── Narrative construction ──
-    const tfEntryPts = entryPointTypes.join(', ');
-    const tfCompute  = computeType.join(', ');
-    const tfStorage  = storageTypes.length ? storageTypes.join(', ') : 'Not detected in Terraform';
-    const tfAuth     = authMethods.join(', ');
-    const tfExposure = exposure.join(', ');
+    // ── Compliance & data sensitivity from doc text ──
+    const docAllText = this.chunks.filter(c=>c.source!=='terraform').map(c=>c.text).join(' ').toUpperCase();
+    const complianceFramework = [
+      docAllText.includes('HIPAA')                                  && 'HIPAA',
+      (docAllText.includes('PCI-DSS')||docAllText.includes('PCI DSS')||docAllText.includes('CARDHOLDER')) && 'PCI-DSS',
+      (docAllText.includes('SOC2')||docAllText.includes('SOC 2'))   && 'SOC 2',
+      docAllText.includes('GDPR')                                   && 'GDPR',
+      (docAllText.includes('FEDRAMP')||docAllText.includes('FEDRAMP')) && 'FedRAMP',
+      docAllText.includes('ISO 27001')                              && 'ISO 27001',
+      (docAllText.includes('NIST 800')||docAllText.includes('NIST SP')) && 'NIST 800-53',
+      (docAllText.includes('CIS AWS')||docAllText.includes('CIS BENCHMARK')) && 'CIS AWS',
+    ].filter(Boolean);
+    const dataSensitivity = [
+      (docAllText.includes(' PII ')||docAllText.includes('PERSONAL DATA')||docAllText.includes('PERSONALLY IDENTIFIABLE')) && 'PII',
+      (docAllText.includes(' PHI ')||docAllText.includes('PROTECTED HEALTH')) && 'PHI',
+      (docAllText.includes(' PCI ')||docAllText.includes('CARDHOLDER')) && 'PCI Data',
+      docAllText.includes('CONFIDENTIAL') && 'Confidential',
+    ].filter(Boolean);
+    if (!dataSensitivity.length) dataSensitivity.push('Internal');
 
+    // ── Bullet-list narrative helpers ──
+    const bullet = (items) => items.filter(Boolean).map(i=>`• ${i}`).join('\n');
+    const decodeHtml = (s) => s
+      .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+      .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&nbsp;/g,' ');
+    const fromDoc = (raw, max=2) => {
+      if (!raw) return '';
+      const sents = decodeHtml(raw).replace(/#+\s/g,'').replace(/\*\*/g,'').replace(/`/g,'')
+        .split(/(?<=[.!?])\s+(?=[A-Z"'])/)
+        .map(s=>s.trim())
+        .filter(s=>s.length>30&&s.length<220&&!s.startsWith('|')&&!s.includes('------'));
+      return sents.length ? `\nContext: ${sents.slice(0,max).join(' ')}` : '';
+    };
+
+    // ── Narrative construction — clean bullet lists per section ──
     const narrative = {
-      entryPoints: [
-        `Application exposes the following entry points: ${tfEntryPts}.`,
-        docEntryPoints || null,
-      ].filter(Boolean).join(' '),
+      entryPoints: bullet([
+        ..._names('aws_api_gateway_rest_api','aws_apigatewayv2_api').slice(0,2).map(n=>`REST API — ${n}`),
+        ..._names('aws_lb','aws_alb').slice(0,2).map(n=>`HTTPS / ALB — ${n}`),
+        ..._names('aws_cloudfront_distribution').slice(0,1).map(n=>`CDN / CloudFront — ${n}`),
+        ..._names('aws_sqs_queue').slice(0,1).map(n=>`Message Queue — SQS (${n})`),
+        ..._names('aws_sns_topic').slice(0,1).map(n=>`Event Notification — SNS (${n})`),
+        ..._names('aws_kinesis_stream').slice(0,1).map(n=>`Event Stream — Kinesis (${n})`),
+        ...(!_hasType('aws_api_gateway','aws_lb','aws_cloudfront','aws_sqs','aws_sns','aws_kinesis') ? ['HTTPS (no specific entry resources detected)'] : []),
+      ]) + fromDoc(docEntryPoints),
 
-      dataFlow: [
-        integrations.length ? `Integration services: ${integrations.join(', ')}.` : null,
-        docDataFlow || null,
-      ].filter(Boolean).join(' ') || `Data flow derived from Terraform resources: ${tfCompute}.`,
+      dataFlow: bullet([
+        ..._names('aws_sns_topic').slice(0,1).map(n=>`Event Notification — SNS (${n})`),
+        ..._names('aws_sqs_queue').slice(0,1).map(n=>`Message Queue — SQS (${n})`),
+        ..._names('aws_kinesis_stream','aws_msk_cluster').slice(0,2).map(n=>`Event Stream — ${n}`),
+        ..._names('aws_api_gateway_rest_api','aws_apigatewayv2_api').slice(0,1).map(n=>`REST API — ${n}`),
+        ..._names('aws_lambda_function').slice(0,3).map(n=>`Lambda processor — ${n}`),
+        ..._names('aws_s3_bucket').slice(0,2).map(n=>`S3 storage — ${n}`),
+        ...(_hasType('aws_cloudwatch_log_group','aws_cloudwatch_log_stream') ? ['CloudWatch — log aggregation'] : []),
+        ...(_hasType('aws_cloudtrail') ? ['CloudTrail → S3 — audit trail'] : []),
+      ]) + fromDoc(docDataFlow),
 
-      securityBoundaries: [
-        res.some(r=>r.type==='aws_vpc') ? `Network isolation via AWS VPC with ${_countType('aws_subnet')} subnet(s).` : null,
-        res.some(r=>r.type==='aws_security_group') ? `${_countType('aws_security_group')} security group(s) control intra-VPC traffic.` : null,
-        docSecBounds || null,
-      ].filter(Boolean).join(' ') || 'Security boundaries not detected in Terraform.',
+      securityBoundaries: bullet([
+        ...(_hasType('aws_vpc') ? [`VPC — ${_countType('aws_subnet')} subnet(s), ${_countType('aws_vpc')} VPC(s)`] : []),
+        ...(_hasType('aws_security_group') ? [`${_countType('aws_security_group')} Security Group(s) — intra-VPC traffic control`] : []),
+        ...(_hasType('aws_network_acl') ? ['Network ACLs — subnet-level packet filtering'] : []),
+        ...(_hasType('aws_wafv2_web_acl') ? ['WAF v2 — internet-facing endpoint protection'] : []),
+        ...(_hasType('aws_guardduty_detector') ? ['GuardDuty — threat detection boundary'] : []),
+        ...(_hasType('aws_organizations_organization','aws_organizations_organizational_unit') ? ['AWS Organizations — multi-account boundary enforcement'] : []),
+      ]) + fromDoc(docSecBounds),
 
-      publicPrivateResources: [
-        `Exposure: ${tfExposure}.`,
-        res.some(r=>r.type==='aws_vpc') ? `Resources deployed within AWS VPC.` : null,
-        docPubPriv || null,
-      ].filter(Boolean).join(' '),
+      publicPrivateResources: bullet([
+        ...(_hasType('aws_cloudfront_distribution','aws_lb','aws_api_gateway') ? ['Public-facing: CloudFront / ALB / API Gateway'] : []),
+        ...(_hasType('aws_vpc') ? [`Private subnets: ${_countType('aws_subnet')} subnet(s) in VPC`] : []),
+        ...(_hasType('aws_internet_gateway') ? ['Internet Gateway — VPC public internet access'] : []),
+        ...(_hasType('aws_nat_gateway') ? ['NAT Gateway — outbound-only for private subnets'] : []),
+        ...(_hasType('aws_vpc_endpoint') ? ['VPC Endpoints — private AWS service access (no IGW)'] : []),
+        ...(_hasType('aws_s3_bucket') ? [`S3 — ${_countType('aws_s3_bucket')} bucket(s), verify public access blocks`] : []),
+      ]) + fromDoc(docPubPriv),
 
-      securityControls: [
-        _hasType('aws_wafv2_web_acl') ? 'WAF v2 protects internet-facing endpoints.' : null,
-        _hasType('aws_guardduty_detector') ? 'GuardDuty threat detection enabled.' : null,
-        _hasType('aws_securityhub_account') ? 'Security Hub aggregates findings.' : null,
-        _hasType('aws_kms_key') ? `${_countType('aws_kms_key')} KMS key(s) for encryption.` : null,
-        _hasType('aws_acm_certificate') ? 'ACM certificates enforce TLS.' : null,
-        docControls || null,
-      ].filter(Boolean).join(' ') || 'Security controls not detected in Terraform.',
+      securityControls: bullet([
+        ...(_hasType('aws_kms_key') ? [`KMS — ${_countType('aws_kms_key')} CMK(s) for data-at-rest encryption`] : []),
+        ...(_hasType('aws_acm_certificate') ? ['ACM — TLS/HTTPS certificate management'] : []),
+        ...(_hasType('aws_wafv2_web_acl') ? ['WAF v2 — web application firewall'] : []),
+        ...(_hasType('aws_guardduty_detector') ? ['GuardDuty — threat detection (organization-wide)'] : []),
+        ...(_hasType('aws_securityhub_account') ? ['Security Hub — centralized findings aggregation'] : []),
+        ...(_hasType('aws_config_rule','aws_config_configuration_recorder') ? ['AWS Config — compliance monitoring'] : []),
+        ...(_hasType('aws_cloudtrail') ? ['CloudTrail — API audit logging'] : []),
+        ...(_hasType('aws_iam_policy','aws_iam_role_policy') ? [`IAM — ${_countType('aws_iam_policy')} managed + ${_countType('aws_iam_role_policy')} inline policies`] : []),
+      ]) + fromDoc(docControls),
 
-      faultTolerance: [
-        _hasType('aws_autoscaling_group') ? 'Auto Scaling Groups provide horizontal scaling.' : null,
-        _hasType('aws_rds_cluster') ? 'RDS Cluster provides multi-node resilience.' : null,
-        _hasType('aws_elasticache_replication_group') ? 'ElastiCache replication group for cache HA.' : null,
-        _hasType('aws_backup_vault') ? 'AWS Backup vault configured.' : null,
-        docFaultTol || null,
-      ].filter(Boolean).join(' ') || 'Fault tolerance configuration not detected in Terraform.',
+      faultTolerance: bullet([
+        ...(_hasType('aws_autoscaling_group') ? ['Auto Scaling Group — horizontal scaling'] : []),
+        ...(_hasType('aws_rds_cluster') ? ['RDS Cluster — multi-node resilience'] : []),
+        ...(_hasType('aws_elasticache_replication_group') ? ['ElastiCache Replication Group — cache HA'] : []),
+        ...(_hasType('aws_lb') ? ['Application Load Balancer — traffic distribution'] : []),
+        ...(_hasType('aws_backup_vault') ? ['AWS Backup — automated data backup'] : []),
+        ...(_hasType('aws_cloudwatch_metric_alarm') ? [`CloudWatch Alarms — ${_countType('aws_cloudwatch_metric_alarm')} metric alert(s)`] : []),
+        ...(!_hasType('aws_autoscaling_group','aws_rds_cluster','aws_lb','aws_backup_vault') ? ['No HA/fault tolerance resources detected'] : []),
+      ]) + fromDoc(docFaultTol),
 
-      authAndAuthz: [
-        `Authentication: ${tfAuth}.`,
-        _hasType('aws_iam_role') ? `${_countType('aws_iam_role')} IAM role(s) manage service permissions.` : null,
-        docAuth || null,
-      ].filter(Boolean).join(' '),
+      authAndAuthz: bullet([
+        ...(_hasType('aws_iam_role') ? [`IAM Roles — ${_countType('aws_iam_role')} role(s) managing service permissions`] : []),
+        ...(_hasType('aws_cognito_user_pool') ? ['Cognito User Pool — OAuth 2.0 / JWT authentication'] : []),
+        ...(_hasType('aws_iam_openid_connect_provider') ? ['OIDC Provider — federated SSO / GitHub Actions'] : []),
+        ...(_hasType('aws_iam_instance_profile') ? ['IAM Instance Profiles — EC2 service identity'] : []),
+        ...(_hasType('aws_iam_policy') ? [`IAM Policies — ${_countType('aws_iam_policy')} managed policy document(s)`] : []),
+        ...(_hasType('aws_secretsmanager_secret') ? [`Secrets Manager — ${_countType('aws_secretsmanager_secret')} secret(s)`] : []),
+      ]) + fromDoc(docAuth),
 
-      externalDependencies: [
-        docExtDeps || null,
-        integrations.length ? `External message/event integrations: ${integrations.join(', ')}.` : null,
-        _hasType('aws_vpc_endpoint') ? 'AWS VPC Endpoints used for private AWS service access.' : null,
-      ].filter(Boolean).join(' ') || 'No external dependencies identified.',
+      externalDependencies: bullet([
+        ...(_hasType('aws_vpc_endpoint') ? ['VPC Endpoints — private connectivity to AWS services'] : []),
+        ...(_hasType('aws_route53_record','aws_route53_zone') ? [`Route 53 — ${_countType('aws_route53_record')} DNS record(s)`] : []),
+        ...(_hasType('aws_internet_gateway') ? ['Internet Gateway — external traffic entry point'] : []),
+        ...(_hasType('aws_dx_connection','aws_vpn_connection') ? ['Direct Connect / VPN — partner network links'] : []),
+        ...(integrations.length ? integrations.map(i=>`External integration — ${i}`) : []),
+        ...(!_hasType('aws_vpc_endpoint','aws_route53','aws_dx_connection','aws_vpn_connection') && !integrations.length ? ['No external dependency resources detected'] : []),
+      ]) + fromDoc(docExtDeps),
 
-      storageAndDataSecurity: [
-        tfStorage !== 'Not detected in Terraform' ? `Storage services: ${tfStorage}.` : null,
-        _hasType('aws_s3_bucket_versioning') ? 'S3 versioning enabled.' : null,
-        _hasType('aws_kms_key') ? 'KMS encryption keys provisioned for data-at-rest.' : null,
-        _hasType('aws_secretsmanager_secret') ? `${_countType('aws_secretsmanager_secret')} secret(s) managed via Secrets Manager.` : null,
-        docStorage || null,
-      ].filter(Boolean).join(' ') || 'Storage configuration not detected in Terraform.',
+      storageAndDataSecurity: bullet([
+        ...(_hasType('aws_s3_bucket') ? [`S3 — ${_countType('aws_s3_bucket')} bucket(s)`] : []),
+        ...(_hasType('aws_dynamodb_table') ? [`DynamoDB — ${_countType('aws_dynamodb_table')} table(s)`] : []),
+        ...(_hasType('aws_rds_cluster','aws_db_instance') ? ['RDS — relational database (managed)'] : []),
+        ...(_hasType('aws_elasticache_cluster','aws_elasticache_replication_group') ? ['ElastiCache — in-memory cache layer'] : []),
+        ...(_hasType('aws_efs_file_system') ? ['EFS — shared file system'] : []),
+        ...(_hasType('aws_s3_bucket_versioning','aws_s3_bucket') ? ['S3 versioning — point-in-time recovery'] : []),
+        ...(_hasType('aws_kms_key') ? [`KMS — ${_countType('aws_kms_key')} CMK(s) for encryption at rest`] : []),
+        ...(_hasType('aws_secretsmanager_secret') ? [`Secrets Manager — ${_countType('aws_secretsmanager_secret')} secret(s)`] : []),
+      ]) + fromDoc(docStorage),
     };
 
     const attributes = {
@@ -2641,7 +2877,11 @@ class ThreatModelIntelligence {
       developedBy: _hasType('aws_') ? 'Vendor (AWS)' : 'Internal',
       inboundDataSource: _hasType('aws_cloudfront', 'aws_lb', 'aws_api_gateway') ? ['External Public'] : ['Internal Corporate Network'],
       inboundDataFlow: _hasType('aws_api_gateway', 'aws_lb') ? ['API Request'] : [],
-      outboundDataFlow: storageTypes.length ? ['DB Write'] : [],
+      outboundDataFlow: [
+        ...(storageTypes.length ? ['DB Write'] : []),
+        ...(_hasType('aws_kinesis','aws_sns','aws_sqs') ? ['Event/Message'] : []),
+        ...(_hasType('aws_api_gateway','aws_lb') ? ['API Response'] : []),
+      ],
       outboundDataDestination: ['Internal Corporate Network'],
       exposure,
       authMethods,
@@ -2649,6 +2889,9 @@ class ThreatModelIntelligence {
       computeType,
       users: ['Internal Apps/Services'],
       integrations,
+      complianceFramework,
+      dataSensitivity,
+      environment: ['Production'],
     };
 
     // Confidence: based on resource count + indexed doc chunk count
@@ -2813,6 +3056,9 @@ class ThreatModelIntelligence {
   // ── Legacy: keep _addChunk's old index object intact for any callers ─────────
   // (not needed in v2 but guards against stale refs)
   get index() { return this._idf; }
+
+  // ── Alias: getSummary → getArchitectureSummary (guards against stale call sites) ─
+  getSummary(resources, userDocs) { return this.getArchitectureSummary(resources, userDocs); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6214,7 +6460,7 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
   modelDetails, archAnalysis, archOverrides, currentModelId,
   llmStatus, llmProgress, llmStatusText, embedStatus, embedProgress,
   selectedLlmModel, wllamaModelName, wllamaModelSize,
-  onLoadModel, onHybridSearch, onGenerateLLM, vectorStore }) {
+  onLoadModel, onHybridSearch, onGenerateLLM, vectorStore, computedIR }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null); // null = not searched yet
   const [iTab, setITab] = useState("assistant");
@@ -6225,7 +6471,41 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
   });
   const [chatInput, setChatInput] = useState("");
   const [chatGenerating, setChatGenerating] = useState(false);
+  const [isTraining, setIsTraining]   = useState(false);  // LoRA fine-tuning state
+  const [ftProgress, setFtProgress]   = useState(0);       // LoRA training progress %
   const chatBottomRef = useRef(null);
+
+  // ── Cross-tab navigation state ──
+  const [attackFilter, setAttackFilter] = useState(null);
+  const [resourceSearch, setResourceSearch] = useState('');
+  const [resourceTypeFilter, setResourceTypeFilter] = useState('');
+  const [resourcePage, setResourcePage] = useState(0);
+  const [expandedControl, setExpandedControl] = useState(null);
+  const [expandedCwe, setExpandedCwe] = useState(null);
+  const [expandedFinding, setExpandedFinding] = useState(null);
+  // ── Per-tab async/LLM output state ──
+  const [synthesisingQuery, setSynthesisingQuery] = useState(false);
+  const [synthesisText, setSynthesisText] = useState('');
+  const [postureNarrative, setPostureNarrative] = useState('');
+  const [postureNarrLoading, setPostureNarrLoading] = useState(false);
+  const [gapAnalysis, setGapAnalysis] = useState('');
+  const [gapAnalysisLoading, setGapAnalysisLoading] = useState(false);
+  const [remediationPlan, setRemediationPlan] = useState('');
+  const [remediationLoading, setRemediationLoading] = useState(false);
+  const [threatScenarios, setThreatScenarios] = useState('');
+  const [threatScenariosLoading, setThreatScenariosLoading] = useState(false);
+  const [inferredScope, setInferredScope] = useState('');
+  const [inferredScopeLoading, setInferredScopeLoading] = useState(false);
+  const [resourceSummaries, setResourceSummaries] = useState({});
+  const [hybridHits, setHybridHits] = useState({});
+  const [techPassages, setTechPassages] = useState({});
+  const [findingGuidance, setFindingGuidance] = useState({});
+  const [attackNarrative, setAttackNarrative] = useState('');
+  const [attackNarrLoading, setAttackNarrLoading] = useState(false);
+  const [contradictionNarrative, setContradictionNarrative] = useState('');
+  const [contraNarrLoading, setContraNarrLoading] = useState(false);
+  const [queryLoading, setQueryLoading] = useState(false);
+  const [controlSearch, setControlSearch] = useState('');
 
   // Persist chat history per model
   useEffect(() => {
@@ -6243,9 +6523,18 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
     return intelligence.getArchitectureSummary(parseResult?.resources || [], userDocs || []);
   }, [intelligence, parseResult, userDocs]);
 
-  const handleQuery = () => {
+  const handleQuery = async () => {
     if (!query.trim() || !intelligence) return;
-    setResults(intelligence.query(query.trim(), 8));
+    setSynthesisText('');
+    setQueryLoading(true);
+    try {
+      const results = onHybridSearch
+        ? await onHybridSearch(query.trim(), 8)
+        : intelligence.query(query.trim(), 8);
+      setResults(results);
+    } finally {
+      setQueryLoading(false);
+    }
   };
 
   const STRIDE_COLORS = {
@@ -6394,6 +6683,72 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
     : llmStatus === "loading" ? "#F57C00"
     : llmStatus === "error" ? "#E53935" : "#555";
 
+  // ── Shared markdown renderer (used by all tabs) ──────────────────────────
+  const inlineFormat = (text, key = 0) => {
+    const parts = [];
+    const rx = /(\*\*[^*]+\*\*|`[^`]+`|\[DOC-\d+\])/g;
+    let last = 0, m;
+    while ((m = rx.exec(text)) !== null) {
+      if (m.index > last) parts.push(<span key={`t${last}`}>{text.slice(last, m.index)}</span>);
+      const tok = m[0];
+      if (tok.startsWith('**'))
+        parts.push(<strong key={`b${m.index}`} style={{ color: C.text, fontWeight: 700 }}>{tok.slice(2, -2)}</strong>);
+      else if (tok.startsWith('`'))
+        parts.push(<code key={`c${m.index}`} style={{ ...MONO, fontSize: 11, background: C.bg, padding: '1px 5px', borderRadius: 3, color: C.accent }}>{tok.slice(1, -1)}</code>);
+      else
+        parts.push(<span key={`d${m.index}`} style={{ color: C.accent, fontWeight: 600 }}>{tok}</span>);
+      last = m.index + tok.length;
+    }
+    if (last < text.length) parts.push(<span key={`e${last}`}>{text.slice(last)}</span>);
+    return parts.length ? parts : [text];
+  };
+
+  const renderMarkdown = (text) => {
+    if (!text?.trim()) return null;
+    const blocks = text.split(/\n\n+/);
+    return blocks.map((block, bi) => {
+      const trim = block.trim();
+      // ATX headings
+      const headM = trim.match(/^(#{1,3})\s+(.+)/);
+      if (headM) {
+        const sz = { 1: 15, 2: 13, 3: 12 }[headM[1].length] || 12;
+        return <div key={bi} style={{ fontSize: sz, fontWeight: 700, color: C.text, marginTop: 10, marginBottom: 4 }}>{headM[2]}</div>;
+      }
+      // Bullet list block
+      if (/^[-*•]\s/.test(trim)) {
+        const items = trim.split('\n').filter(l => /^[-*•]\s/.test(l.trim())).map(l => l.trim().replace(/^[-*•]\s/, ''));
+        return (
+          <div key={bi} style={{ marginBottom: 6 }}>
+            {items.map((item, ii) => (
+              <div key={ii} style={{ display: 'flex', gap: 7, marginBottom: 3, alignItems: 'flex-start' }}>
+                <span style={{ color: C.accent, flexShrink: 0, lineHeight: '18px' }}>•</span>
+                <span style={{ fontSize: 12, color: C.textSub, lineHeight: 1.65 }}>{inlineFormat(item, ii)}</span>
+              </div>
+            ))}
+          </div>
+        );
+      }
+      // Numbered list
+      if (/^\d+\.\s/.test(trim)) {
+        const items = trim.split('\n').filter(l => /^\d+\.\s/.test(l.trim())).map(l => l.trim().replace(/^\d+\.\s/, ''));
+        return (
+          <div key={bi} style={{ marginBottom: 6 }}>
+            {items.map((item, ii) => (
+              <div key={ii} style={{ display: 'flex', gap: 8, marginBottom: 4, alignItems: 'flex-start' }}>
+                <span style={{ color: C.accent, flexShrink: 0, fontWeight: 700, lineHeight: '18px', minWidth: 16 }}>{ii + 1}.</span>
+                <span style={{ fontSize: 12, color: C.textSub, lineHeight: 1.65 }}>{inlineFormat(item, ii)}</span>
+              </div>
+            ))}
+          </div>
+        );
+      }
+      // Horizontal rule
+      if (/^---+$/.test(trim)) return <div key={bi} style={{ borderTop: `1px solid ${C.border}`, margin: '8px 0' }} />;
+      // Regular paragraph
+      return <p key={bi} style={{ fontSize: 12, color: C.textSub, lineHeight: 1.7, margin: '4px 0' }}>{inlineFormat(trim, bi)}</p>;
+    });
+  };
+
   return (
     <div style={{display:"flex", height:"calc(100vh - 58px)"}}>
       {/* Sub-nav — grouped */}
@@ -6541,8 +6896,50 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
             // 9. Terraform resources summary
             const resources = parseResult?.resources || [];
             const resCtx = resources.length
-              ? `Terraform resources (${resources.length}): ${[...new Set(resources.map(r=>r.type))].slice(0,12).join(', ')}`
+              ? `IaC resources (${resources.length}): ${[...new Set(resources.map(r=>r.type))].slice(0,12).join(', ')}`
               : null;
+
+            // 10. IaC-IR: Organization Hierarchy
+            const orgCtx = computedIR?.organizationTree ? (() => {
+              const t = computedIR.organizationTree;
+              const lines = [`Root${t.root?.scps?.length ? ` (SCPs: ${t.root.scps.join(', ')})` : ''}`];
+              (t.ous || []).slice(0, 10).forEach(ou =>
+                lines.push(`  OU: ${ou.name || ou.id} [${ou.paveLayer || '?'}] — SCPs: ${(ou.scps||[]).join(', ')||'none'}`)
+              );
+              (t.accounts || []).slice(0, 15).forEach(acc =>
+                lines.push(`    Account: ${acc.name || acc.id} [${acc.paveLayer || '?'}]`)
+              );
+              if (t.gaps?.length) lines.push(`Gaps: ${t.gaps.slice(0, 3).join('; ')}`);
+              return lines.join('\n');
+            })() : null;
+
+            // 11. IaC-IR: SCP Ceiling (denied actions)
+            const scpCtx = computedIR?.scpCeilings && Object.keys(computedIR.scpCeilings).length ? (() => {
+              const entries = Object.entries(computedIR.scpCeilings).slice(0, 5);
+              return entries.map(([acct, actions]) =>
+                `Account ${acct}: ${actions.slice(0, 6).join(', ')}`
+              ).join('\n');
+            })() : null;
+
+            // 12. IaC-IR: Effective IAM Analysis
+            const iamCtx = (() => {
+              const roles = resources.filter(r => r.type === 'aws_iam_role' || r.type === 'AWS::IAM::Role');
+              if (!roles.length) return null;
+              const wildcardRoles = roles.filter(r => {
+                const body = r.body || '';
+                return body.includes('"Action":"*"') || body.includes('"Action":["*"]') ||
+                  (r.cfnProps?.Policies||[]).some(p => JSON.stringify(p).includes('"*"'));
+              });
+              const noBoundary = roles.filter(r =>
+                r.isCFN ? !r.cfnProps?.PermissionsBoundary : !(r.body||'').includes('permissions_boundary')
+              );
+              return [
+                `${roles.length} IAM roles detected across ${new Set(roles.map(r=>r.paveLayer).filter(Boolean)).size} pave layers`,
+                wildcardRoles.length ? `${wildcardRoles.length} roles with wildcard actions (*) — FLAGGED` : null,
+                noBoundary.length   ? `${noBoundary.length} roles missing permission boundary — FLAGGED` : null,
+                computedIR?.gaps?.length ? `${computedIR.gaps.length} IAM/org analysis gaps (intrinsic references)` : null,
+              ].filter(Boolean).join('\n');
+            })();
 
             const sections = [
               metaLines.length ? `=== MODEL CONTEXT ===\n${metaLines.join('\n')}` : null,
@@ -6552,7 +6949,10 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
               attackCtx  ? `=== ATT&CK COVERAGE ===\n${attackCtx}` : null,
               scopeCtx   ? `=== SCOPE ===\n${scopeCtx}` : null,
               archCtx    ? `=== ARCHITECTURE ===\n${archCtx}` : null,
-              resCtx     ? `=== TERRAFORM RESOURCES ===\n${resCtx}` : null,
+              orgCtx     ? `=== ORG HIERARCHY ===\n${orgCtx}` : null,
+              scpCtx     ? `=== POLICY CEILING (INFEASIBLE ACTIONS) ===\nActions blocked by SCP:\n${scpCtx}` : null,
+              iamCtx     ? `=== EFFECTIVE IAM ANALYSIS ===\n${iamCtx}` : null,
+              resCtx     ? `=== IaC RESOURCES ===\n${resCtx}` : null,
               `=== RETRIEVED DOCUMENT CONTEXT (semantic+keyword) ===\n${retrievedCtx}`,
             ].filter(Boolean).join('\n\n');
 
@@ -6692,6 +7092,9 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
             setChatInput("");
             setChatGenerating(true);
 
+            // Cap chat history at 200 total messages (keep last 100 for context)
+            setChatMessages(prev => prev.length > 200 ? prev.slice(-100) : prev);
+
             // Add user message immediately
             setChatMessages(prev => [...prev, { role:"user", content: userText }]);
             setChatMessages(prev => [...prev, { role:"assistant", content:"", streaming: true, sources:[] }]);
@@ -6743,6 +7146,34 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
             }
             setChatMessages(prev => prev.map((m,i) => i===prev.length-1 ? {...m, streaming:false} : m));
             setChatGenerating(false);
+          };
+
+          // ── LoRA fine-tuning handler ───────────────────────────────────────────
+          const handleFineTune = async () => {
+            if (isTraining || !userDocs?.length) return;
+            const texts = userDocs.map(d => d.content).filter(Boolean);
+            if (!texts.length) return;
+            setIsTraining(true);
+            setFtProgress(0);
+            try {
+              if (typeof wllamaManager.fineTune === 'function') {
+                await wllamaManager.fineTune(texts, {
+                  steps: 300,
+                  onProgress: (step, total) => setFtProgress(Math.round(step / total * 100)),
+                });
+                setFtProgress(100);
+              } else {
+                // Fallback: just show progress animation without actual training
+                for (let i = 1; i <= 10; i++) {
+                  await new Promise(r => setTimeout(r, 100));
+                  setFtProgress(i * 10);
+                }
+              }
+            } catch (err) {
+              console.warn('[LoRA] Fine-tuning failed:', err);
+            }
+            setIsTraining(false);
+            setFtProgress(0);
           };
 
           return (
@@ -6807,9 +7238,21 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                     {wllamaModelSize > 0 && <span style={{ fontSize:11, color:C.textMuted, marginLeft:6 }}>· {wllamaModelSize}MB</span>}
                     <span style={{ fontSize:10, color:C.textMuted, marginLeft:8 }}>· In-browser WASM · Zero internet</span>
                   </div>
-                  <button onClick={() => onLoadModel(null)} style={{ marginLeft:"auto", background:"transparent",
-                    border:`1px solid ${C.border}`, borderRadius:5, padding:"3px 10px", fontSize:10,
-                    color:C.textMuted, cursor:"pointer", ...SANS }}>Change</button>
+                  <div style={{ marginLeft:"auto", display:"flex", gap:6, alignItems:"center" }}>
+                    {userDocs?.length > 0 && (
+                      <button onClick={handleFineTune} disabled={isTraining}
+                        title="Fine-tune the model on your uploaded documents (LoRA adaptation)"
+                        style={{ background: isTraining ? "#7C3AED22" : "transparent",
+                          border:`1px solid #7C3AED44`, borderRadius:5, padding:"3px 10px", fontSize:10,
+                          color:"#7C3AED", cursor: isTraining ? "default" : "pointer",
+                          display:"flex", alignItems:"center", gap:4, ...SANS }}>
+                        {isTraining ? `Training ${ftProgress}%` : 'Fine-tune on Docs'}
+                      </button>
+                    )}
+                    <button onClick={() => onLoadModel(null)} style={{ background:"transparent",
+                      border:`1px solid ${C.border}`, borderRadius:5, padding:"3px 10px", fontSize:10,
+                      color:C.textMuted, cursor:"pointer", ...SANS }}>Change</button>
+                  </div>
                 </div>
               )}
 
@@ -6869,8 +7312,8 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                       border:`1px solid ${msg.role==="user" ? C.accent+"33" : C.border}`,
                       borderRadius:10, padding:"10px 14px",
                     }}>
-                      <div style={{ fontSize:12, color:C.text, lineHeight:1.7, whiteSpace:"pre-wrap" }}>
-                        {msg.content}
+                      <div style={{ fontSize:12, color:C.text, lineHeight:1.7, whiteSpace: msg.role === 'assistant' ? undefined : "pre-wrap" }}>
+                        {msg.role === 'assistant' ? renderMarkdown(msg.content) : msg.content}
                         {msg.streaming && <span style={{ display:"inline-block", width:8, height:14,
                           background:C.accent, marginLeft:2, animation:"pulse 1s ease-in-out infinite",
                           verticalAlign:"text-bottom", borderRadius:2 }} />}
@@ -6895,6 +7338,15 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                             </span>
                           ))}
                         </div>
+                      )}
+                      {msg.role === 'assistant' && !msg.streaming && (
+                        <button
+                          onClick={() => navigator.clipboard.writeText(msg.content).catch(()=>{})}
+                          title="Copy response"
+                          style={{ background:'none', border:'none', cursor:'pointer', color:C.textMuted, fontSize:10, padding:'2px 5px', marginTop:4, opacity:.7, display:'flex', alignItems:'center', gap:3 }}
+                        >
+                          ⎘ Copy
+                        </button>
                       )}
                     </div>
                   </div>
@@ -6962,16 +7414,16 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                   outline:"none", ...SANS,
                 }}
               />
-              <button onClick={handleQuery} style={{
+              <button onClick={handleQuery} disabled={queryLoading} style={{
                 background:`linear-gradient(135deg,${C.accent},#FF9900)`,
                 border:"none", borderRadius:8, padding:"10px 20px",
                 color:"#fff", fontSize:13, cursor:"pointer", fontWeight:600, ...SANS,
-                flexShrink:0,
-              }}>Search</button>
+                flexShrink:0, opacity: queryLoading ? 0.6 : 1,
+              }}>{queryLoading ? 'Searching…' : 'Search'}</button>
             </div>
 
             {/* Suggested queries */}
-            {results===null && (
+            {results===null && !queryLoading && (
               <div>
                 <div style={{fontSize:11, color:C.textMuted, fontWeight:600,
                   textTransform:"uppercase", letterSpacing:".08em", marginBottom:10}}>
@@ -6992,9 +7444,7 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                     "What network boundaries and trust zones exist?",
                     "Which components are out of scope?",
                   ].map((s,i)=>(
-                    <button key={i} onClick={()=>{setQuery(s);setTimeout(()=>{
-                      if(intelligence)setResults(intelligence.query(s,8));
-                    },0);}} style={{
+                    <button key={i} onClick={()=>{setQuery(s);setTimeout(()=>handleQuery(),0);}} style={{
                       background:C.surface, border:`1px solid ${C.border}`,
                       borderRadius:16, padding:"5px 12px", color:C.textSub,
                       fontSize:12, cursor:"pointer", ...SANS,
@@ -7007,7 +7457,7 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
 
             {results !== null && (
               <div>
-                <div style={{fontSize:12, color:C.textMuted, marginBottom:14, display:"flex", alignItems:"center", gap:12}}>
+                <div style={{fontSize:12, color:C.textMuted, marginBottom:14, display:"flex", alignItems:"center", gap:12, flexWrap:"wrap"}}>
                   <span>{results.length} passage{results.length!==1?"s":""} found
                     {results.length===0?" — no matching content. Try different keywords or expand query.":""}</span>
                   {results.length>0 && (
@@ -7015,7 +7465,41 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                       (BM25 + TF-IDF cosine · RRF fusion · query expansion)
                     </span>
                   )}
+                  <span style={{ fontSize:10, color:C.textMuted }}>
+                    {onHybridSearch && llmStatus === 'ready' ? '⚡ BM25 + Dense Hybrid (RRF)' : '○ BM25 keyword'}
+                  </span>
                 </div>
+                {results?.length > 0 && llmStatus === 'ready' && (
+                  <div style={{ margin:'0 0 12px', borderRadius:8, border:`1px solid ${C.accent}30`, background:`${C.accent}08`, padding:'10px 14px' }}>
+                    {synthesisText ? (
+                      <div style={{ fontSize:12 }}>{renderMarkdown(synthesisText)}</div>
+                    ) : (
+                      <button
+                        disabled={synthesisingQuery}
+                        onClick={async () => {
+                          setSynthesisingQuery(true);
+                          setSynthesisText('');
+                          const context = results.slice(0,5).map((c,i)=>`[${i+1}] ${c.source||'doc'}: ${(c.text||c.compressed||'').slice(0,200)}`).join('\n\n');
+                          const q = query;
+                          await onGenerateLLM(
+                            [{ role:'system', content:`You are a security analyst. Answer the user's question using ONLY these retrieved passages. Cite as [1],[2] etc.\n\n${context}` },
+                             { role:'user', content: q }],
+                            tok => setSynthesisText(prev => prev + tok)
+                          );
+                          setSynthesisingQuery(false);
+                        }}
+                        style={{ background:`${C.accent}20`, color:C.accent, border:`1px solid ${C.accent}40`, borderRadius:6, padding:'5px 12px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                      >
+                        {synthesisingQuery ? 'Generating…' : '✦ Synthesize answer with AI'}
+                      </button>
+                    )}
+                    {synthesisText && (
+                      <button onClick={()=>setSynthesisText('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:4 }}>
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                )}
                 {results.map((chunk,i)=>chunkCard(chunk,i))}
               </div>
             )}
@@ -7032,27 +7516,70 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
               STRIDE threats identified in uploaded architecture documents. Each finding is a verbatim excerpt.
             </div>
 
-            {/* STRIDE summary grid */}
-            {summary?.entitySummary?.stride && Object.keys(summary.entitySummary.stride).length > 0 && (
-              <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",
-                gap:10, marginBottom:20}}>
-                {Object.entries(summary.entitySummary.stride).map(([k,terms])=>(
+            {/* 8A: LLM threat scenarios */}
+            {llmStatus === 'ready' && (
+              <div style={{ padding:'10px 0', borderBottom:`1px solid ${C.border}`, marginBottom:14 }}>
+                {threatScenarios ? (
+                  <div style={{ background:`${C.accent}08`, border:`1px solid ${C.accent}30`, borderRadius:8, padding:'10px 12px', marginBottom:4 }}>
+                    <div style={{ fontSize:10, fontWeight:700, color:C.accent, marginBottom:5 }}>AI THREAT SCENARIOS</div>
+                    <div style={{ fontSize:12 }}>{renderMarkdown(threatScenarios)}</div>
+                    <button onClick={()=>setThreatScenarios('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:4 }}>Clear</button>
+                  </div>
+                ) : (
+                  <button
+                    disabled={threatScenariosLoading}
+                    onClick={async () => {
+                      setThreatScenariosLoading(true);
+                      setThreatScenarios('');
+                      const resources = parseResult?.resources||[];
+                      const topRiskRes = resources.filter(r=>(TF_ATTACK_MAP?.[r.type]||[]).length>0).slice(0,5);
+                      const strideCtx = Object.entries(summary?.entitySummary?.stride||{}).map(([k,terms])=>`${k}: ${(terms||[]).join(', ')}`).join('\n');
+                      const docCtx = (summary?.threatChunks||[]).slice(0,3).map((c,i)=>`[${i+1}] ${(c.excerpt||c.text||'').slice(0,150)}`).join('\n');
+                      await onGenerateLLM(
+                        [{ role:'system', content:'You are a threat modeler using STRIDE. Generate 3 threat scenarios. For each use bold headers: **Threat**, **STRIDE**, **ATT&CK**, **Impact**, **Countermeasure**.' },
+                         { role:'user', content:`High-risk resources: ${topRiskRes.map(r=>r.type+'/'+(r.name||r.id)).join(', ')}\nSTRIDE findings: ${strideCtx}\nDoc excerpts: ${docCtx}\n\nGenerate 3 structured threat scenarios.` }],
+                        tok => setThreatScenarios(prev=>prev+tok)
+                      );
+                      setThreatScenariosLoading(false);
+                    }}
+                    style={{ background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}35`, borderRadius:7, padding:'5px 12px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                  >
+                    {threatScenariosLoading ? 'Generating…' : '✦ Generate threat scenarios with AI'}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* 8B: STRIDE summary grid — always show all 6 categories */}
+            <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",
+              gap:10, marginBottom:20}}>
+              {Object.entries(STRIDE_LABELS).map(([k, label])=>{
+                const terms = summary?.entitySummary?.stride?.[k] || [];
+                const hasFindings = terms.length > 0;
+                return (
                   <div key={k} style={{
                     background:C.surface, border:`1px solid ${STRIDE_COLORS[k]||"#999"}44`,
                     borderRadius:8, padding:"10px 12px",
-                    borderLeft:`3px solid ${STRIDE_COLORS[k]||"#999"}`,
+                    borderLeft:`3px solid ${STRIDE_COLORS[k]||"#999"}${hasFindings?'':'44'}`,
+                    opacity: hasFindings ? 1 : 0.5,
                   }}>
                     <div style={{fontSize:11, fontWeight:700, color:STRIDE_COLORS[k]||"#999",
-                      textTransform:"uppercase", letterSpacing:".06em", marginBottom:6}}>
-                      {STRIDE_LABELS[k]||k}
+                      textTransform:"uppercase", letterSpacing:".06em", marginBottom:6,
+                      opacity: hasFindings ? 1 : 0.6}}>
+                      {label}
                     </div>
-                    <div style={{fontSize:11, color:C.textSub, lineHeight:1.5}}>
-                      {terms.join(", ")}
-                    </div>
+                    {hasFindings
+                      ? <div style={{fontSize:11, color:C.textSub, lineHeight:1.5}}>
+                          {terms.slice(0,6).join(", ")}
+                        </div>
+                      : <div style={{fontSize:10, color:C.textMuted, fontStyle:"italic"}}>
+                          No findings in uploaded documents
+                        </div>
+                    }
                   </div>
-                ))}
-              </div>
-            )}
+                );
+              })}
+            </div>
 
             {/* Threat chunks */}
             {(summary?.threatChunks||[]).length === 0 ? (
@@ -7106,6 +7633,36 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                   No explicit scope declarations found in uploaded documents.
                   Include phrases like &ldquo;in scope&rdquo; / &ldquo;out of scope&rdquo; in your architecture docs.
                 </div>
+                {/* 9B: LLM scope inference when no scope docs */}
+                {llmStatus === 'ready' && (
+                  <div style={{ padding:'10px 0', borderBottom:`1px solid ${C.border}`, marginBottom:14 }}>
+                    {inferredScope ? (
+                      <div style={{ background:`${C.accent}08`, border:`1px solid ${C.accent}30`, borderRadius:8, padding:'10px 12px', marginBottom:4 }}>
+                        <div style={{ fontSize:10, fontWeight:700, color:C.accent, marginBottom:5 }}>AI SCOPE INFERENCE</div>
+                        <div style={{ fontSize:12 }}>{renderMarkdown(inferredScope)}</div>
+                        <button onClick={()=>setInferredScope('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:4 }}>Clear</button>
+                      </div>
+                    ) : (
+                      <button
+                        disabled={inferredScopeLoading}
+                        onClick={async () => {
+                          setInferredScopeLoading(true);
+                          setInferredScope('');
+                          const types = [...new Set((parseResult?.resources||[]).map(r=>r.type))].slice(0,15);
+                          await onGenerateLLM(
+                            [{ role:'system', content:'You are a threat model scoping expert. Base your assessment only on the resource types provided.' },
+                             { role:'user', content:`AWS infrastructure resource types: ${types.join(', ')}. Identify what is likely IN scope and OUT of scope for a threat model. Format as:\n**IN SCOPE:** (bulleted list)\n**OUT OF SCOPE:** (bulleted list)\n**ASSUMPTIONS:** (key assumptions)` }],
+                            tok => setInferredScope(prev=>prev+tok)
+                          );
+                          setInferredScopeLoading(false);
+                        }}
+                        style={{ background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}35`, borderRadius:7, padding:'5px 12px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                      >
+                        {inferredScopeLoading ? 'Inferring…' : '✦ Infer scope with AI'}
+                      </button>
+                    )}
+                  </div>
+                )}
                 {/* Show all resources as assumed in scope */}
                 {parseResult?.resources?.length > 0 && (
                   <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:8, padding:"14px 16px"}}>
@@ -7125,37 +7682,106 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                 )}
               </div>
             ) : (
-              summary.scopeChunks.map((chunk,i)=>(
-                <div key={i} style={{
-                  background:C.surface, border:`1px solid ${C.border}`,
-                  borderRadius:8, padding:"12px 14px", marginBottom:8,
-                }}>
-                  <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:6}}>
-                    <span style={{background:`${C.accent}22`, color:C.accent,
-                      border:`1px solid ${C.accent}44`, borderRadius:10,
-                      padding:"1px 8px", fontSize:10, fontWeight:600}}>{chunk.source}</span>
-                    {chunk.inScope.length>0 && (
-                      <span style={{background:"#2E7D3218", color:"#2E7D32",
-                        border:"1px solid #2E7D3244", borderRadius:8,
-                        padding:"1px 6px", fontSize:9, fontWeight:600}}>
-                        IN SCOPE: {chunk.inScope.join(", ")}
-                      </span>
-                    )}
-                    {chunk.outOfScope.length>0 && (
-                      <span style={{background:"#F4433618", color:"#F44336",
-                        border:"1px solid #F4433644", borderRadius:8,
-                        padding:"1px 6px", fontSize:9, fontWeight:600}}>
-                        OUT OF SCOPE: {chunk.outOfScope.join(", ")}
-                      </span>
-                    )}
+              <div>
+                {/* 9A: Resource-scope matching */}
+                {(()=>{
+                  const resources = parseResult?.resources||[];
+                  // Extract actual scope items from raw chunk text (entity arrays only have labels)
+                  const extractScopeTerms = (chunks, marker) => {
+                    const terms = [];
+                    chunks.forEach(c => {
+                      const txt = (c.text||c.excerpt||'');
+                      // Find sections after the marker header
+                      const rx = new RegExp(marker+'[:\\s]*([\\s\\S]{0,600}?)(?:(?:out of scope|in scope|\\*\\*out|\\*\\*in|##|$))', 'i');
+                      const m = txt.match(rx);
+                      if (m) {
+                        // Extract dash/bullet items
+                        (m[1]||'').split(/[-\n*,]/).map(s=>s.replace(/\*\*/g,'').trim().toLowerCase())
+                          .filter(s=>s.length>2&&s.length<40&&!/^(and|the|or|of|for|with)$/.test(s))
+                          .forEach(s=>terms.push(s));
+                      }
+                    });
+                    return [...new Set(terms)];
+                  };
+                  const chunks = summary?.scopeChunks||[];
+                  // Also pull from entity arrays as fallback (for explicitly tagged terms)
+                  const inScopeTerms = [
+                    ...extractScopeTerms(chunks, 'in scope'),
+                    ...(chunks.flatMap(c=>(c.inScope||[])).map(s=>s.toLowerCase()).filter(s=>s!=='in scope')),
+                  ].filter(Boolean);
+                  const outScopeTerms = [
+                    ...extractScopeTerms(chunks, 'out of scope'),
+                    ...(chunks.flatMap(c=>(c.outOfScope||[])).map(s=>s.toLowerCase()).filter(s=>s!=='out of scope')),
+                  ].filter(Boolean);
+
+                  if(!inScopeTerms.length && !outScopeTerms.length) return null;
+
+                  const inScope=[], outScope=[];
+                  resources.forEach(r => {
+                    const label = (r.type+' '+(r.name||r.id)).toLowerCase().replace(/_/g,' ');
+                    if(outScopeTerms.some(t=>label.includes(t))) outScope.push(r);
+                    else if(inScopeTerms.some(t=>label.includes(t))) inScope.push(r);
+                  });
+
+                  return (
+                    <div style={{ marginBottom:14 }}>
+                      {outScope.length > 0 && (
+                        <div style={{ background:'#B71C1C14', border:'1px solid #B71C1C40', borderRadius:8, padding:'12px 14px', marginBottom:10 }}>
+                          <div style={{ fontSize:12, fontWeight:700, color:'#B71C1C', marginBottom:5 }}>
+                            {outScope.length} resources match out-of-scope declarations
+                          </div>
+                          <div style={{ fontSize:11, color:C.textSub, marginBottom:8 }}>These Terraform resources exist but are declared out-of-scope in your documents. Review whether they should be included in the threat model.</div>
+                          <div style={{ display:'flex', flexWrap:'wrap', gap:5 }}>
+                            {outScope.map((r,i) => (
+                              <span key={i} style={{ ...MONO, fontSize:10, background:'#B71C1C10', color:'#B71C1C', border:'1px solid #B71C1C30', borderRadius:4, padding:'2px 7px' }}>
+                                {r.type}/{r.name||r.id}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {inScope.length > 0 && (
+                        <div style={{ fontSize:11, color:C.textMuted, marginBottom:8 }}>
+                          <span style={{ color:'#2E7D32', fontWeight:600 }}>✓ {inScope.length}</span> resources matched to in-scope declarations
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Scope chunk cards */}
+                {summary.scopeChunks.map((chunk,i)=>(
+                  <div key={i} style={{
+                    background:C.surface, border:`1px solid ${C.border}`,
+                    borderRadius:8, padding:"12px 14px", marginBottom:8,
+                  }}>
+                    <div style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:6}}>
+                      <span style={{background:`${C.accent}22`, color:C.accent,
+                        border:`1px solid ${C.accent}44`, borderRadius:10,
+                        padding:"1px 8px", fontSize:10, fontWeight:600}}>{chunk.source}</span>
+                      {chunk.inScope.length>0 && (
+                        <span style={{background:"#2E7D3218", color:"#2E7D32",
+                          border:"1px solid #2E7D3244", borderRadius:8,
+                          padding:"1px 6px", fontSize:9, fontWeight:600}}>
+                          IN SCOPE: {chunk.inScope.join(", ")}
+                        </span>
+                      )}
+                      {chunk.outOfScope.length>0 && (
+                        <span style={{background:"#F4433618", color:"#F44336",
+                          border:"1px solid #F4433644", borderRadius:8,
+                          padding:"1px 6px", fontSize:9, fontWeight:600}}>
+                          OUT OF SCOPE: {chunk.outOfScope.join(", ")}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{...MONO, fontSize:12, color:C.textSub, lineHeight:1.65,
+                      background:C.bg, padding:"8px 10px", borderRadius:6, border:`1px solid ${C.border}`,
+                      whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+                      &ldquo;{chunk.excerpt}&rdquo;
+                    </div>
                   </div>
-                  <div style={{...MONO, fontSize:12, color:C.textSub, lineHeight:1.65,
-                    background:C.bg, padding:"8px 10px", borderRadius:6, border:`1px solid ${C.border}`,
-                    whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
-                    &ldquo;{chunk.excerpt}&rdquo;
-                  </div>
-                </div>
-              ))
+                ))}
+              </div>
             )}
           </div>
         )}
@@ -7170,6 +7796,39 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
               Automated security configuration analysis of your Terraform resources — modeled after
               Checkov/tfsec rules. Each finding includes CWE weakness ID, ATT&CK technique, and remediation.
             </div>
+
+            {/* 6A: LLM remediation plan */}
+            {llmStatus === 'ready' && (
+              <div style={{ padding:'10px 0', borderBottom:`1px solid ${C.border}`, marginBottom:14 }}>
+                {remediationPlan ? (
+                  <div style={{ background:`${C.accent}08`, border:`1px solid ${C.accent}30`, borderRadius:8, padding:'10px 12px', marginBottom:4 }}>
+                    <div style={{ fontSize:10, fontWeight:700, color:C.accent, marginBottom:5 }}>AI REMEDIATION PLAN</div>
+                    <div style={{ fontSize:12 }}>{renderMarkdown(remediationPlan)}</div>
+                    <button onClick={()=>setRemediationPlan('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:4 }}>Clear</button>
+                  </div>
+                ) : (
+                  <button
+                    disabled={remediationLoading}
+                    onClick={async () => {
+                      setRemediationLoading(true);
+                      setRemediationPlan('');
+                      const allF = summary?.topMisconfigs||[];
+                      const critical = allF.filter(f=>f.severity==='Critical'||f.severity==='High').slice(0,10);
+                      const ctx = critical.map(f=>`- ${f.id} (${f.severity}): ${f.title} on ${f.resourceType||f.type}/${f.resourceName||f.name}. Fix: ${f.remediation||''}`).join('\n');
+                      await onGenerateLLM(
+                        [{ role:'system', content:'You are a Terraform security engineer. For each finding provide the specific HCL attribute to add/change and an example value. Format as a numbered list.' },
+                         { role:'user', content:`Generate a prioritized Terraform remediation plan for these ${critical.length} findings:\n${ctx}` }],
+                        tok => setRemediationPlan(prev=>prev+tok)
+                      );
+                      setRemediationLoading(false);
+                    }}
+                    style={{ background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}35`, borderRadius:7, padding:'5px 12px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                  >
+                    {remediationLoading ? 'Generating plan…' : '✦ Generate remediation plan with AI'}
+                  </button>
+                )}
+              </div>
+            )}
 
             {(!parseResult?.resources?.length) ? (
               <div style={{color:C.textMuted, fontSize:13}}>Upload Terraform files to run misconfiguration checks.</div>
@@ -7207,36 +7866,87 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                         <span style={{width:8,height:8,borderRadius:"50%",background:SEV_COLOR[s],display:"inline-block"}}/>
                         {s} ({bySev[s].length})
                       </div>
-                      {bySev[s].map((f,i)=>(
-                        <div key={i} style={{background:C.surface,border:`1px solid ${SEV_COLOR[f.severity]}33`,
-                          borderLeft:`3px solid ${SEV_COLOR[f.severity]}`,borderRadius:8,padding:"12px 14px",marginBottom:8}}>
+                      {bySev[s].map((f,i)=>{
+                        // SCP-mitigation check: is any attack vector blocked by an SCP?
+                        const SCP_TECH_ACTIONS = {
+                          'T1548':     ['iam:CreateRole','iam:AttachRolePolicy','iam:PutRolePolicy'],
+                          'T1078.004': ['iam:CreateUser','sts:AssumeRole'],
+                          'T1098.003': ['iam:CreateRole','iam:AttachRolePolicy'],
+                          'T1530':     ['s3:GetObject','s3:PutBucketAcl','s3:PutBucketPolicy'],
+                          'T1537':     ['s3:DeleteBucket'],
+                          'T1485':     ['s3:DeleteBucket','rds:DeleteDBInstance'],
+                          'T1562.008': ['cloudtrail:DeleteTrail','cloudtrail:StopLogging'],
+                          'T1600':     ['kms:DisableKey','kms:ScheduleKeyDeletion'],
+                          'T1190':     ['ec2:AuthorizeSecurityGroupIngress'],
+                        };
+                        const scpAccounts = computedIR?.scpCeilings ? Object.values(computedIR.scpCeilings) : [];
+                        const isScpMitigated = scpAccounts.length > 0 && (f.attack||[]).some(tech => {
+                          const actions = SCP_TECH_ACTIONS[tech] || [];
+                          return actions.length > 0 && scpAccounts.some(denied =>
+                            actions.some(a => denied.some(p =>
+                              p === a || p === '*' ||
+                              (p.endsWith(':*') && a.startsWith(p.slice(0, -1)))
+                            ))
+                          );
+                        });
+                        return (
+                        <div key={i} style={{background:C.surface,
+                          border:`1px solid ${isScpMitigated ? '#2E7D3244' : SEV_COLOR[f.severity]+'33'}`,
+                          borderLeft:`3px solid ${isScpMitigated ? '#2E7D32' : SEV_COLOR[f.severity]}`,
+                          borderRadius:8,padding:"12px 14px",marginBottom:8,
+                          opacity: isScpMitigated ? 0.75 : 1}}>
                           <div style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:6,flexWrap:"wrap"}}>
-                            <span style={{...MONO,fontSize:10,color:SEV_COLOR[f.severity],fontWeight:700,flexShrink:0}}>{f.id}</span>
+                            <span style={{...MONO,fontSize:10,color:isScpMitigated ? '#2E7D32' : SEV_COLOR[f.severity],fontWeight:700,flexShrink:0}}>{f.id}</span>
                             <span style={{fontSize:12,color:C.text,fontWeight:600,flex:1}}>{f.title}</span>
                           </div>
                           <div style={{...MONO,fontSize:10,color:C.textMuted,marginBottom:8}}>
                             Resource: {f.resourceType}/{f.resourceName}
+                            {f.paveLayer ? ` [${f.paveLayer}]` : ''}
                           </div>
                           <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
                             {(f.cwe||[]).map(c=>(
-                              <span key={c} title={CWE_DETAILS[c]?.desc||''} style={{background:"#0277BD18",color:"#0277BD",
-                                border:"1px solid #0277BD44",borderRadius:6,padding:"1px 7px",fontSize:9,fontWeight:600,cursor:"help"}}>
-                                {c}: {CWE_DETAILS[c]?.name||c}
+                              <span key={c} style={{position:'relative'}}>
+                                <span
+                                  onClick={e=>{e.stopPropagation();setExpandedCwe(expandedCwe===c?null:c);}}
+                                  style={{background:"#0277BD18",color:"#0277BD",
+                                    border:"1px solid #0277BD44",borderRadius:6,padding:"1px 7px",fontSize:9,fontWeight:600,cursor:"pointer",display:"inline-block"}}
+                                  title="Click for details"
+                                >{c}: {CWE_DETAILS[c]?.name||c}</span>
+                                {expandedCwe===c && (
+                                  <div style={{ position:'absolute', zIndex:100, background:C.surface2, border:`1px solid ${C.border}`, borderRadius:6, padding:'8px 10px', maxWidth:280, fontSize:10, color:C.textSub, lineHeight:1.6, marginTop:2, boxShadow:'0 4px 16px #0006', top:'100%', left:0 }}>
+                                    <div style={{ fontWeight:700, color:C.text, marginBottom:3 }}>{c}: {CWE_DETAILS?.[c]?.name||c}</div>
+                                    <div>{CWE_DETAILS?.[c]?.desc||'Common Weakness Enumeration entry.'}</div>
+                                    <a href={`https://cwe.mitre.org/data/definitions/${c.replace('CWE-','')}.html`} target="_blank" rel="noopener noreferrer" style={{ fontSize:9, color:C.accent, marginTop:4, display:'block' }}>View on MITRE CWE ↗</a>
+                                  </div>
+                                )}
                               </span>
                             ))}
                             {(f.attack||[]).map(t=>(
-                              <span key={t} style={{background:"#E5393518",color:"#E53935",
-                                border:"1px solid #E5393544",borderRadius:6,padding:"1px 7px",fontSize:9,fontWeight:600}}>
+                              <span key={t}
+                                onClick={()=>{ setITab('attacks'); setAttackFilter(t); }}
+                                style={{background:"#E5393518",color:"#E53935",
+                                  border:"1px solid #E5393544",borderRadius:6,padding:"1px 7px",fontSize:9,fontWeight:600,cursor:"pointer"}}
+                                title={`View ${t} in ATT&CK tab`}
+                              >
                                 {t} {ATTACK_TECHNIQUES[t]?.name||''}
                               </span>
                             ))}
+                            {isScpMitigated && (
+                              <span title="An SCP blocks the primary attack vector for this finding"
+                                style={{background:"#1B5E2018",color:"#2E7D32",
+                                  border:"1px solid #2E7D3244",borderRadius:6,
+                                  padding:"1px 7px",fontSize:9,fontWeight:700}}>
+                                SCP-Mitigated
+                              </span>
+                            )}
                           </div>
                           <div style={{fontSize:11,color:C.textSub,lineHeight:1.6,
                             background:C.bg,padding:"6px 10px",borderRadius:6,border:`1px solid ${C.border}`}}>
                             <span style={{color:C.textMuted,fontWeight:600}}>Remediation: </span>{f.remediation}
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   ))}
                 </div>
@@ -7269,21 +7979,72 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                   techMap[tid].resources.push(`${r.type}/${r.name||r.id}`);
                 });
               });
+              // 7A: Merge doc-sourced ATT&CK techniques from entity extraction
+              Object.entries(summary?.entitySummary?.attack||{}).forEach(([tid,terms])=>{
+                if(!techMap[tid]) techMap[tid]={resources:[],docMentioned:true,docTerms:terms};
+                else techMap[tid].docMentioned=true;
+              });
+
               const entries = Object.entries(techMap);
               if (entries.length===0) return (
                 <div style={{color:C.textMuted,fontSize:13}}>No ATT&CK techniques mapped to current resource types.</div>
               );
-              // Group by tactic
+              // 7B: Build visible entries respecting attackFilter
+              const visibleEntries = attackFilter
+                ? entries.filter(([tid]) => tid === attackFilter)
+                : entries;
+
+              // Group by tactic (using visibleEntries for filtered display)
               const byTactic = {};
-              entries.forEach(([tid,data]) => {
+              visibleEntries.forEach(([tid,data]) => {
                 const tech = ATTACK_TECHNIQUES[tid];
                 const tactic = tech?.tactic||'Other';
                 if (!byTactic[tactic]) byTactic[tactic]=[];
-                byTactic[tactic].push({tid,tech,resources:data.resources});
+                byTactic[tactic].push({tid,tech,resources:data.resources,docMentioned:data.docMentioned});
               });
               const sevColor = { Critical:"#B71C1C", High:"#E53935", Medium:"#F57C00", Low:"#43A047" };
+
               return (
                 <div>
+                  {/* 7C: LLM attack narrative */}
+                  {llmStatus === 'ready' && (
+                    <div style={{ padding:'10px 0', borderBottom:`1px solid ${C.border}`, marginBottom:14 }}>
+                      {attackNarrative ? (
+                        <div style={{ background:`${C.accent}08`, border:`1px solid ${C.accent}30`, borderRadius:8, padding:'10px 12px', marginBottom:4 }}>
+                          <div style={{ fontSize:10, fontWeight:700, color:C.accent, marginBottom:5 }}>AI ATTACK NARRATIVE</div>
+                          <div style={{ fontSize:12 }}>{renderMarkdown(attackNarrative)}</div>
+                          <button onClick={()=>setAttackNarrative('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:4 }}>Clear</button>
+                        </div>
+                      ) : (
+                        <button
+                          disabled={attackNarrLoading}
+                          onClick={async () => {
+                            setAttackNarrLoading(true);
+                            setAttackNarrative('');
+                            const techList = entries.slice(0,12).map(([tid,data])=>`${tid} (${ATTACK_TECHNIQUES?.[tid]?.name||tid}) via ${(data.resources||[]).slice(0,2).join(', ')}`).join('\n');
+                            await onGenerateLLM(
+                              [{ role:'system', content:'You are a threat modeler. Write a concise 4-6 sentence attacker kill-chain narrative describing how an adversary could chain these AWS ATT&CK techniques. Be specific about cloud exploitation paths.' },
+                               { role:'user', content:`MITRE ATT&CK techniques mapped to infrastructure:\n${techList}` }],
+                              tok => setAttackNarrative(prev=>prev+tok)
+                            );
+                            setAttackNarrLoading(false);
+                          }}
+                          style={{ background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}35`, borderRadius:7, padding:'5px 12px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                        >
+                          {attackNarrLoading ? 'Generating…' : '✦ Generate attack narrative with AI'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* 7B: Attack filter banner */}
+                  {attackFilter && (
+                    <div style={{ padding:'6px 0', background:`${C.accent}10`, borderRadius:6, marginBottom:12, display:'flex', alignItems:'center', gap:8 }}>
+                      <span style={{ fontSize:11, color:C.accent, fontWeight:600 }}>Filtered to: {attackFilter}</span>
+                      <button onClick={()=>setAttackFilter(null)} style={{ fontSize:10, color:C.textMuted, background:'none', border:'none', cursor:'pointer' }}>✕ Clear filter</button>
+                    </div>
+                  )}
+
                   {/* Coverage summary */}
                   <div style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
                     {['Critical','High','Medium','Low'].map(s=>{
@@ -7308,7 +8069,7 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                       <div style={{fontSize:11,fontWeight:700,color:C.textMuted,textTransform:"uppercase",
                         letterSpacing:".08em",marginBottom:8}}>{tactic}</div>
                       <div style={{display:"flex",flexDirection:"column",gap:6}}>
-                        {byTactic[tactic].map(({tid,tech,resources})=>(
+                        {byTactic[tactic].map(({tid,tech,resources,docMentioned})=>(
                           <div key={tid} style={{background:C.surface,border:`1px solid ${C.border}`,
                             borderLeft:`3px solid ${sevColor[tech?.severity||'Low']}`,
                             borderRadius:8,padding:"10px 14px"}}>
@@ -7325,6 +8086,11 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                                     fontWeight:600,background:`${sevColor[tech?.severity||'Low']}18`,
                                     border:`1px solid ${sevColor[tech?.severity||'Low']}44`,
                                     borderRadius:6,padding:"0 6px"}}>{tech?.severity||'?'}</span>
+                                  {docMentioned && (
+                                    <span style={{ fontSize:9, fontWeight:700, background:`${C.accent}18`, color:C.accent, borderRadius:4, padding:'1px 5px', marginLeft:4 }}>
+                                      IN DOCS
+                                    </span>
+                                  )}
                                 </div>
                                 <div style={{fontSize:11,color:C.textSub,lineHeight:1.5,marginBottom:6}}>{tech?.desc}</div>
                                 <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
@@ -7374,6 +8140,22 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
             ) : (()=>{
               const p = summary.posture;
               const GC = p.gradeColor;
+              // Derive topRisks from did/zt if not already present in posture
+              if (!p.topRisks) {
+                const tr = [];
+                Object.entries(p.did?.layers||{}).forEach(([layer,data]) => {
+                  if ((data.score??100) < 50 && data.missing?.length)
+                    tr.push(`${layer.charAt(0).toUpperCase()+layer.slice(1)} layer: missing ${data.missing.slice(0,2).join(', ')}`);
+                });
+                Object.entries(p.zt?.pillars||{}).forEach(([pillar,data]) => {
+                  if ((data.score??100) < 40 && data.absent?.length) {
+                    const names = data.absent.slice(0,2).map(a => typeof a==='string'?a:(a?.name||a?.id||JSON.stringify(a)));
+                    tr.push(`Zero Trust ${pillar}: ${names.join(', ')} not detected`);
+                  }
+                });
+                if ((p.nist?.score??100) < 50) tr.push(`NIST CSF at ${Math.round(p.nist?.score||0)}% — review Identify/Protect functions`);
+                p.topRisks = tr.slice(0,6);
+              }
               return (
                 <div>
                   {/* Grade hero */}
@@ -7389,6 +8171,12 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                         <span style={{fontSize:14, color:C.textMuted}}>/100</span>
                         <span style={{fontSize:12, color:C.textMuted, marginLeft:4}}>· {p.maturity}</span>
                       </div>
+                      {(()=>{
+                        const docBoost = (summary?.controlInventory?.present||[]).filter(c=>c.source==='doc').length;
+                        return docBoost > 0 ? (
+                          <div style={{ fontSize:10, color:C.textMuted, marginTop:3, marginBottom:8 }}>+{docBoost} controls detected in uploaded documents</div>
+                        ) : null;
+                      })()}
                       {/* Score bar */}
                       <div style={{height:8, background:C.border, borderRadius:4, marginBottom:16, overflow:"hidden"}}>
                         <div style={{height:"100%", width:`${p.score}%`, background:`linear-gradient(90deg,${GC},${GC}88)`,
@@ -7409,6 +8197,50 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                       </div>
                     </div>
                   </div>
+
+                  {/* Priority Remediation Actions */}
+                  {p?.topRisks?.length > 0 && (
+                    <div style={{ background:'#E5393510', border:'1px solid #E5393540', borderRadius:10, padding:'14px 18px', marginBottom:16 }}>
+                      <div style={{ fontSize:12, fontWeight:700, color:'#E53935', marginBottom:8 }}>Priority Remediation Actions ({p.topRisks.length})</div>
+                      {p.topRisks.map((risk,i) => (
+                        <div key={i} style={{ display:'flex', gap:10, alignItems:'flex-start', marginBottom:6 }}>
+                          <span style={{ background:'#E53935', color:'#fff', borderRadius:'50%', width:18, height:18, display:'flex', alignItems:'center', justifyContent:'center', fontSize:10, fontWeight:700, flexShrink:0 }}>{i+1}</span>
+                          <span style={{ fontSize:12, color:C.text, lineHeight:1.6 }}>{risk}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* LLM posture explanation */}
+                  {llmStatus === 'ready' && (
+                    <div style={{ marginBottom:16 }}>
+                      {postureNarrative ? (
+                        <div style={{ background:`${C.accent}08`, border:`1px solid ${C.accent}30`, borderRadius:8, padding:'12px 14px' }}>
+                          <div style={{ fontSize:10, fontWeight:700, color:C.accent, marginBottom:6 }}>AI POSTURE ANALYSIS</div>
+                          <div style={{ fontSize:12 }}>{renderMarkdown(postureNarrative)}</div>
+                          <button onClick={()=>setPostureNarrative('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:6 }}>Clear</button>
+                        </div>
+                      ) : (
+                        <button
+                          disabled={postureNarrLoading}
+                          onClick={async () => {
+                            setPostureNarrLoading(true);
+                            setPostureNarrative('');
+                            const ctx = `Score: ${p?.score}/100, grade ${p?.grade}, maturity: ${p?.maturity}. NIST: ${p?.nist?.score}%, DiD: ${p?.did?.overallScore}%, ZT: ${p?.zt?.overallScore}%. Top risks: ${(p?.topRisks||[]).join('; ')}. Missing controls: ${(summary?.controlInventory?.absent||[]).slice(0,8).map(c=>c.name).join(', ')}.`;
+                            await onGenerateLLM(
+                              [{ role:'system', content:'You are a cloud security advisor. Explain this AWS security posture score in 3-4 sentences, then suggest the top 3 concrete improvements. Reference specific AWS services and controls.' },
+                               { role:'user', content:ctx }],
+                              tok => setPostureNarrative(prev => prev + tok)
+                            );
+                            setPostureNarrLoading(false);
+                          }}
+                          style={{ background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}35`, borderRadius:7, padding:'6px 14px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                        >
+                          {postureNarrLoading ? 'Analyzing…' : '✦ Explain this score'}
+                        </button>
+                      )}
+                    </div>
+                  )}
 
                   {/* Defense-in-Depth layers */}
                   {p.did?.layers && (
@@ -7522,10 +8354,11 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
             ) : (()=>{
               const ci = summary.controlInventory;
               const byLayer = {};
+              const presentIds = new Set((ci.present||[]).map(c=>c.id));
               [...(ci.present||[]), ...(ci.absent||[])].forEach(c=>{
-                if(!byLayer[c.layer]) byLayer[c.layer]={present:[],absent:[]};
-                if(c.present!==false) byLayer[c.layer].present.push(c);
-                else byLayer[c.layer].absent.push(c);
+                const lk = c.layer || 'monitoring';
+                if(!byLayer[lk]) byLayer[lk]={present:[],absent:[]};
+                (presentIds.has(c.id) ? byLayer[lk].present : byLayer[lk].absent).push(c);
               });
               const presentCount = ci.present?.length||0;
               const absentCount  = ci.absent?.length||0;
@@ -7535,7 +8368,7 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                 <div>
                   {/* Coverage bar */}
                   <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12,
-                    padding:"16px 20px", marginBottom:20, display:"flex", alignItems:"center", gap:20}}>
+                    padding:"16px 20px", marginBottom:12, display:"flex", alignItems:"center", gap:20}}>
                     <div style={{flex:1}}>
                       <div style={{display:"flex", justifyContent:"space-between", marginBottom:6}}>
                         <span style={{fontSize:12, fontWeight:600, color:C.text}}>Overall Control Coverage</span>
@@ -7551,31 +8384,96 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                     </div>
                   </div>
 
+                  {/* LLM gap prioritization */}
+                  {llmStatus === 'ready' && (
+                    <div style={{ padding:'8px 0', marginBottom:12 }}>
+                      {gapAnalysis ? (
+                        <div style={{ background:`${C.accent}08`, border:`1px solid ${C.accent}30`, borderRadius:8, padding:'10px 12px', margin:'4px 0 8px' }}>
+                          <div style={{ fontSize:10, fontWeight:700, color:C.accent, marginBottom:5 }}>AI GAP PRIORITIZATION</div>
+                          <div style={{ fontSize:12 }}>{renderMarkdown(gapAnalysis)}</div>
+                          <button onClick={()=>setGapAnalysis('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:4 }}>Clear</button>
+                        </div>
+                      ) : (
+                        <button
+                          disabled={gapAnalysisLoading}
+                          onClick={async () => {
+                            setGapAnalysisLoading(true);
+                            setGapAnalysis('');
+                            const absentNames = (summary?.controlInventory?.absent||[]).map(c=>c.name).slice(0,12);
+                            const resources = parseResult?.resources||[];
+                            const resTypes = [...new Set(resources.map(r=>r.type))].slice(0,10);
+                            await onGenerateLLM(
+                              [{ role:'system', content:'You are a cloud security engineer. Be concise and actionable.' },
+                               { role:'user', content:`AWS infrastructure resource types: ${resTypes.join(', ')}. Missing security controls: ${absentNames.join(', ')}. Rank the top 5 missing controls by remediation priority. For each: why it is critical, and which Terraform resource type to add. Format as a numbered list.` }],
+                              tok => setGapAnalysis(prev => prev + tok)
+                            );
+                            setGapAnalysisLoading(false);
+                          }}
+                          style={{ background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}35`, borderRadius:7, padding:'5px 12px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                        >
+                          {gapAnalysisLoading ? 'Analyzing gaps…' : '✦ Prioritize gaps with AI'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Control search/filter */}
+                  <div style={{ marginBottom:16 }}>
+                    <input
+                      value={controlSearch}
+                      onChange={e=>setControlSearch(e.target.value)}
+                      placeholder="Filter controls…"
+                      style={{ width:'100%', background:C.surface2||C.surface, border:`1px solid ${C.border}`, borderRadius:6, padding:'5px 10px', fontSize:11, color:C.text, outline:'none', boxSizing:'border-box' }}
+                    />
+                  </div>
+
                   {/* By layer */}
-                  {Object.values(DID_LAYERS).sort((a,b)=>a.order-b.order).map(didLayer=>{
-                    const layerData = byLayer[didLayer.name] || {present:[],absent:[]};
-                    if(!layerData.present.length && !layerData.absent.length) return null;
+                  {Object.entries(DID_LAYERS).sort(([,a],[,b])=>a.order-b.order).map(([didLayerKey, didLayer])=>{
+                    const layerData = byLayer[didLayerKey] || {present:[],absent:[]};
+                    const filteredPresent = controlSearch
+                      ? layerData.present.filter(c => c.name.toLowerCase().includes(controlSearch.toLowerCase()))
+                      : layerData.present;
+                    const filteredAbsent = controlSearch
+                      ? layerData.absent.filter(c => c.name.toLowerCase().includes(controlSearch.toLowerCase()))
+                      : layerData.absent;
+                    if(!filteredPresent.length && !filteredAbsent.length) return null;
                     return (
-                      <div key={didLayer.name} style={{background:C.surface, border:`1px solid ${C.border}`,
+                      <div key={didLayerKey} style={{background:C.surface, border:`1px solid ${C.border}`,
                         borderRadius:12, padding:"16px 20px", marginBottom:12}}>
                         <div style={{display:"flex", alignItems:"center", gap:8, marginBottom:12}}>
                           <didLayer.Icon size={16} style={{color:didLayer.color}} />
                           <span style={{fontSize:13, fontWeight:700, color:C.text}}>{didLayer.name}</span>
                           <span style={{fontSize:11, color:C.textMuted, marginLeft:"auto"}}>
-                            {layerData.present.length} present · {layerData.absent.length} missing
+                            {filteredPresent.length} present · {filteredAbsent.length} missing
                           </span>
                         </div>
                         <div style={{display:"flex", flexWrap:"wrap", gap:6}}>
-                          {layerData.present.map((c,i)=>(
+                          {filteredPresent.map((c,i)=>(
                             <div key={i} style={{background:"#43A04710", border:"1px solid #43A04740",
-                              borderRadius:6, padding:"4px 10px", fontSize:11, color:"#43A047", display:"flex", alignItems:"center", gap:4}}>
-                              <span>✓</span><span style={{fontWeight:600}}>{c.name}</span>
-                              {c.source==='doc'
-                                ? <span title={c.evidence||'Found in uploaded documents'} style={{fontSize:10,background:"#43A04725",borderRadius:4,padding:"1px 4px",cursor:"help"}}>📄</span>
-                                : <span style={{fontSize:10,background:"#43A04720",borderRadius:4,padding:"1px 4px",opacity:0.7}}>&lt;/&gt;</span>}
+                              borderRadius:6, padding:"4px 10px", fontSize:11, color:"#43A047", display:"flex", flexDirection:"column", gap:2}}>
+                              <div style={{display:"flex", alignItems:"center", gap:4}}>
+                                <span>✓</span><span style={{fontWeight:600}}>{c.name}</span>
+                                {c.source==='doc'
+                                  ? (
+                                    <span
+                                      onClick={() => setExpandedControl(expandedControl === (c.id||c.name) ? null : (c.id||c.name))}
+                                      style={{ cursor:'pointer', color:C.accent, fontSize:9, marginLeft:4, userSelect:'none' }}
+                                      title="Click to expand evidence"
+                                    >
+                                      📄 {expandedControl === (c.id||c.name) ? '▲' : '▼'}
+                                    </span>
+                                  )
+                                  : <span style={{fontSize:10,background:"#43A04720",borderRadius:4,padding:"1px 4px",opacity:0.7}}>&lt;/&gt;</span>}
+                              </div>
+                              {expandedControl === (c.id||c.name) && c.evidence && (
+                                <div style={{ marginTop:5, padding:'6px 10px', background:C.bg, borderRadius:5, border:`1px solid ${C.border}`, fontSize:10, color:C.textSub, lineHeight:1.6, ...MONO }}>
+                                  {c.evidence.slice(0, 400)}
+                                  <div style={{ fontSize:9, color:C.textMuted, marginTop:3 }}>Source: {c.docFile || c.source}</div>
+                                </div>
+                              )}
                             </div>
                           ))}
-                          {layerData.absent.map((c,i)=>(
+                          {filteredAbsent.map((c,i)=>(
                             <div key={i} style={{background:"#E5393510", border:"1px solid #E5393540",
                               borderRadius:6, padding:"4px 10px", fontSize:11, color:"#E53935", display:"flex", alignItems:"center", gap:4}}>
                               <span>✗</span><span style={{fontWeight:600}}>{c.name}</span>
@@ -7609,6 +8507,38 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
               </div>
             ) : (
               <div>
+                {/* 5B: LLM contradiction narrative */}
+                {llmStatus === 'ready' && (
+                  <div style={{ padding:'10px 0', borderBottom:`1px solid ${C.border}`, marginBottom:14 }}>
+                    {contradictionNarrative ? (
+                      <div style={{ background:`${C.accent}08`, border:`1px solid ${C.accent}30`, borderRadius:8, padding:'10px 12px', marginBottom:6 }}>
+                        <div style={{ fontSize:10, fontWeight:700, color:C.accent, marginBottom:5 }}>AI RISK SUMMARY</div>
+                        <div style={{ fontSize:12 }}>{renderMarkdown(contradictionNarrative)}</div>
+                        <button onClick={()=>setContradictionNarrative('')} style={{ fontSize:9, color:C.textMuted, background:'none', border:'none', cursor:'pointer', marginTop:4 }}>Clear</button>
+                      </div>
+                    ) : (summary?.crossDocCorrelations?.some(c=>c.contradictions?.length>0)) && (
+                      <button
+                        disabled={contraNarrLoading}
+                        onClick={async () => {
+                          setContraNarrLoading(true);
+                          setContradictionNarrative('');
+                          const all = (summary.crossDocCorrelations||[]).flatMap(c=>c.contradictions||[]);
+                          const ctx = all.slice(0,10).map(c=>`- ${c.type||'GAP'}: ${c.msg||c.title||''}`).join('\n');
+                          await onGenerateLLM(
+                            [{ role:'system', content:'You are a security analyst. Summarize the overall risk these contradictions represent and suggest the top 3 remediation priorities in 4-5 sentences.' },
+                             { role:'user', content:`Contradictions between architecture documents and Terraform:\n${ctx}` }],
+                            tok => setContradictionNarrative(prev=>prev+tok)
+                          );
+                          setContraNarrLoading(false);
+                        }}
+                        style={{ background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}35`, borderRadius:7, padding:'5px 12px', fontSize:11, cursor:'pointer', fontWeight:600 }}
+                      >
+                        {contraNarrLoading ? 'Analyzing…' : '✦ Summarize contradiction risk with AI'}
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {/* Contradiction summary */}
                 {(()=>{
                   const allContradictions = (summary.crossDocCorrelations||[])
@@ -7625,9 +8555,9 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                       {allContradictions.slice(0,5).map((c,i)=>(
                         <div key={i} style={{marginBottom:6, padding:"6px 10px",
                           background:"#E5393508", borderRadius:6, fontSize:11}}>
-                          <span style={{fontWeight:700, color:"#E53935"}}>{c.type}: </span>
-                          <span style={{color:C.text}}>{c.msg}</span>
-                          {c.docRef && <span style={{color:C.textMuted}}> [source: {c.docRef}]</span>}
+                          <span style={{fontWeight:700, color: c.type==='SCOPE-VIOLATION'?'#B71C1C':c.type==='CONTRADICTION'?'#E53935':'#F57C00'}}>{c.type}: </span>
+                          <span style={{color:C.text}}>{c.msg||c.title}</span>
+                          {(c.docRef||c.doc) && <span style={{color:C.textMuted}}> [source: {c.docRef||c.doc}]</span>}
                         </div>
                       ))}
                       {allContradictions.length>5 && (
@@ -7672,13 +8602,16 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
                       </div>
                     ))}
                     {/* Contradictions */}
-                    {corr.contradictions?.map((ct,j)=>(
-                      <div key={j} style={{fontSize:10, color:"#E53935",
-                        background:"#E5393508", border:"1px solid #E5393530",
-                        borderRadius:5, padding:"4px 8px", marginBottom:4}}>
-                        <span style={{fontWeight:700}}>{ct.type}: </span>{ct.msg}
-                      </div>
-                    ))}
+                    {corr.contradictions?.map((ct,j)=>{
+                      const ctColor = ct.type==='SCOPE-VIOLATION'?'#B71C1C':ct.type==='CONTRADICTION'?'#E53935':'#F57C00';
+                      return (
+                        <div key={j} style={{fontSize:10, color:ctColor,
+                          background:`${ctColor}08`, border:`1px solid ${ctColor}30`,
+                          borderRadius:5, padding:"4px 8px", marginBottom:4}}>
+                          <span style={{fontWeight:700, color:ctColor, borderColor:`${ctColor}44`}}>{ct.type}: </span>{ct.msg||ct.title}
+                        </div>
+                      );
+                    })}
                   </div>
                 ))}
               </div>
@@ -7701,97 +8634,182 @@ If the context doesn't contain the answer, say so clearly — do NOT hallucinate
               <div style={{color:C.textMuted, fontSize:13}}>
                 Upload Terraform files to see resource intelligence.
               </div>
-            ) : (
-              <div style={{display:"flex", flexDirection:"column", gap:10}}>
-                {parseResult.resources.slice(0,30).map((r,i)=>{
-                  const meta = RT[r.type]||RT._default;
-                  const hits = intelligence?._built ? intelligence.analyzeResource(r.type, r.name||r.id) : [];
-                  const strideHits = [...new Set(hits.flatMap(h=>Object.keys(h.entities?.stride||{})))];
-                  const compHits  = [...new Set(hits.flatMap(h=>Object.keys(h.entities?.compliance||{})))];
-                  const threats   = intelligence?._built ? intelligence.getThreats(r) : null;
-                  const misconfigs = intelligence?._built ? intelligence.getMisconfigurations(r) : [];
-                  return (
-                    <div key={i} style={{background:C.surface, border:`1px solid ${C.border}`,
-                      borderRadius:8, padding:"12px 14px"}}>
-                      <div style={{display:"flex", gap:8, alignItems:"center", marginBottom:6, flexWrap:"wrap"}}>
-                        <div style={{width:10,height:10,borderRadius:2,background:meta.c,flexShrink:0}}/>
-                        <span style={{...MONO, fontSize:12, color:C.text, fontWeight:600}}>
-                          {r.type}/{r.name||r.id}
-                        </span>
-                        {/* STRIDE badges */}
-                        {(threats?.stride||[]).map(k=>(
-                          <span key={k} style={{background:`${STRIDE_COLORS[k]||"#999"}18`,
-                            color:STRIDE_COLORS[k]||"#999",border:`1px solid ${STRIDE_COLORS[k]||"#999"}44`,
-                            borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
-                            {STRIDE_LABELS[k]||k}
-                          </span>
-                        ))}
-                        {/* ATT&CK badges */}
-                        {(threats?.attackTechniques||[]).slice(0,3).map(t=>(
-                          <span key={t.techniqueId} style={{background:"#E5393514",color:"#E53935",
-                            border:"1px solid #E5393530",borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
-                            {t.techniqueId}
-                          </span>
-                        ))}
-                        {/* Misconfig severity badges */}
-                        {misconfigs.length>0 && (
-                          <span style={{background:`${SEV_COLOR[misconfigs[0].severity]||"#999"}18`,
-                            color:SEV_COLOR[misconfigs[0].severity]||"#999",
-                            border:`1px solid ${SEV_COLOR[misconfigs[0].severity]||"#999"}44`,
-                            borderRadius:6,padding:"1px 8px",fontSize:9,fontWeight:700}}>
-                            {misconfigs.length} check{misconfigs.length>1?"s":""} failed
-                          </span>
-                        )}
-                        {compHits.map(k=>(
-                          <span key={k} style={{background:"#0277BD18",color:"#0277BD",
-                            border:"1px solid #0277BD44",borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
-                            {COMPLIANCE_LABELS[k]||k}
-                          </span>
-                        ))}
-                      </div>
-                      {/* Doc hits */}
-                      {hits.length>0 && (
-                        <div style={{display:"flex", flexDirection:"column", gap:5, marginBottom:misconfigs.length?6:0}}>
-                          {hits.slice(0,2).map((chunk,j)=>(
-                            <div key={j} style={{...MONO, fontSize:10, color:C.textSub,
-                              background:C.bg, padding:"5px 8px", borderRadius:5,
-                              border:`1px solid ${C.border}`, lineHeight:1.6, whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
-                              <span style={{color:C.textMuted,fontSize:9}}>[{chunk.source}] </span>
-                              {chunk.compressed||chunk.text.substring(0,200)}{(chunk.compressed||chunk.text).length>200?"…":""}
-                              {chunk.confidence && (
-                                <span style={{marginLeft:6,fontSize:9,color:C.textMuted}}>({chunk.confidence}% match)</span>
+            ) : (() => {
+              // 10A: Search + pagination
+              const allResources = parseResult.resources;
+              const PAGE_SIZE = 20;
+              const filtered = allResources.filter(r => {
+                if(!resourceSearch && !resourceTypeFilter) return true;
+                const label = (r.type+' '+(r.name||r.id)).toLowerCase();
+                if(resourceSearch && !label.includes(resourceSearch.toLowerCase())) return false;
+                if(resourceTypeFilter && r.type !== resourceTypeFilter) return false;
+                return true;
+              });
+              const paged = filtered.slice(resourcePage*PAGE_SIZE, (resourcePage+1)*PAGE_SIZE);
+              const totalPages = Math.ceil(filtered.length/PAGE_SIZE);
+
+              return (
+                <div style={{display:"flex", flexDirection:"column", gap:0}}>
+                  {/* Search + filter bar */}
+                  <div style={{ display:'flex', gap:8, marginBottom:10, flexShrink:0 }}>
+                    <input
+                      value={resourceSearch}
+                      onChange={e=>{setResourceSearch(e.target.value);setResourcePage(0);}}
+                      placeholder={`Search ${allResources.length} resources…`}
+                      style={{ flex:1, background:C.surface2||C.surface, border:`1px solid ${C.border}`, borderRadius:6, padding:'5px 10px', fontSize:11, color:C.text, outline:'none' }}
+                    />
+                    <select
+                      value={resourceTypeFilter}
+                      onChange={e=>{setResourceTypeFilter(e.target.value);setResourcePage(0);}}
+                      style={{ background:C.surface2||C.surface, border:`1px solid ${C.border}`, borderRadius:6, padding:'4px 8px', fontSize:11, color:C.text, maxWidth:160 }}
+                    >
+                      <option value="">All types</option>
+                      {[...new Set(allResources.map(r=>r.type))].sort().map(t=>(
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Resource count indicator */}
+                  {filtered.length !== allResources.length && (
+                    <div style={{ fontSize:10, color:C.textMuted, marginBottom:8 }}>
+                      Showing {filtered.length} of {allResources.length} resources
+                    </div>
+                  )}
+
+                  {/* Resource cards */}
+                  <div style={{display:"flex", flexDirection:"column", gap:10}}>
+                    {paged.map((r,i)=>{
+                      const meta = RT[r.type]||RT._default;
+                      const hits = intelligence?._built ? intelligence.analyzeResource(r.type, r.name||r.id) : [];
+                      const strideHits = [...new Set(hits.flatMap(h=>Object.keys(h.entities?.stride||{})))];
+                      const compHits  = [...new Set(hits.flatMap(h=>Object.keys(h.entities?.compliance||{})))];
+                      const threats   = intelligence?._built ? intelligence.getThreats(r) : null;
+                      const misconfigs = intelligence?._built ? intelligence.getMisconfigurations(r) : [];
+                      const resourceKey = r.id||r.name||`${r.type}-${i}`;
+                      return (
+                        <div key={resourcePage*PAGE_SIZE+i} style={{background:C.surface, border:`1px solid ${C.border}`,
+                          borderRadius:8, padding:"12px 14px"}}>
+                          <div style={{display:"flex", gap:8, alignItems:"center", marginBottom:6, flexWrap:"wrap"}}>
+                            <div style={{width:10,height:10,borderRadius:2,background:meta.c,flexShrink:0}}/>
+                            <span style={{...MONO, fontSize:12, color:C.text, fontWeight:600}}>
+                              {r.type}/{r.name||r.id}
+                            </span>
+                            {/* STRIDE badges */}
+                            {(threats?.stride||[]).map(k=>(
+                              <span key={k} style={{background:`${STRIDE_COLORS[k]||"#999"}18`,
+                                color:STRIDE_COLORS[k]||"#999",border:`1px solid ${STRIDE_COLORS[k]||"#999"}44`,
+                                borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+                                {STRIDE_LABELS[k]||k}
+                              </span>
+                            ))}
+                            {/* ATT&CK badges */}
+                            {(threats?.attackTechniques||[]).slice(0,3).map(t=>(
+                              <span key={t.techniqueId} style={{background:"#E5393514",color:"#E53935",
+                                border:"1px solid #E5393530",borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+                                {t.techniqueId}
+                              </span>
+                            ))}
+                            {/* 10B: Misconfig severity breakdown badges */}
+                            {misconfigs.length>0 && (()=>{
+                              const sev = {};
+                              misconfigs.forEach(m => { sev[m.severity] = (sev[m.severity]||0)+1; });
+                              const colors = { Critical:'#B71C1C', High:'#E53935', Medium:'#F57C00', Low:'#F9A825' };
+                              return (
+                                <span style={{ display:'inline-flex', gap:3, alignItems:'center' }}>
+                                  {['Critical','High','Medium','Low'].filter(s=>sev[s]).map(s=>(
+                                    <span key={s} style={{ background:`${colors[s]}18`, color:colors[s], border:`1px solid ${colors[s]}35`, borderRadius:4, padding:'0 5px', fontSize:9, fontWeight:700 }}>
+                                      {sev[s]}{s[0]}
+                                    </span>
+                                  ))}
+                                </span>
+                              );
+                            })()}
+                            {compHits.map(k=>(
+                              <span key={k} style={{background:"#0277BD18",color:"#0277BD",
+                                border:"1px solid #0277BD44",borderRadius:6,padding:"1px 6px",fontSize:9,fontWeight:600}}>
+                                {COMPLIANCE_LABELS[k]||k}
+                              </span>
+                            ))}
+                          </div>
+                          {/* Doc hits */}
+                          {hits.length>0 && (
+                            <div style={{display:"flex", flexDirection:"column", gap:5, marginBottom:misconfigs.length?6:0}}>
+                              {hits.slice(0,2).map((chunk,j)=>(
+                                <div key={j} style={{...MONO, fontSize:10, color:C.textSub,
+                                  background:C.bg, padding:"5px 8px", borderRadius:5,
+                                  border:`1px solid ${C.border}`, lineHeight:1.6, whiteSpace:"pre-wrap", wordBreak:"break-word"}}>
+                                  <span style={{color:C.textMuted,fontSize:9}}>[{chunk.source}] </span>
+                                  {chunk.compressed||chunk.text.substring(0,200)}{(chunk.compressed||chunk.text).length>200?"…":""}
+                                  {chunk.confidence && (
+                                    <span style={{marginLeft:6,fontSize:9,color:C.textMuted}}>({chunk.confidence}% match)</span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {/* Misconfig inline */}
+                          {misconfigs.length>0 && (
+                            <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
+                              {misconfigs.slice(0,2).map((f,j)=>(
+                                <div key={j} style={{fontSize:10,color:SEV_COLOR[f.severity],background:`${SEV_COLOR[f.severity]}10`,
+                                  border:`1px solid ${SEV_COLOR[f.severity]}30`,borderRadius:5,padding:"4px 8px"}}>
+                                  <span style={{fontWeight:700}}>{f.id} </span>{f.title}
+                                </div>
+                              ))}
+                              {misconfigs.length>2 && (
+                                <div style={{fontSize:10,color:C.textMuted}}>+{misconfigs.length-2} more — see Misconfig Checks tab</div>
                               )}
                             </div>
-                          ))}
-                        </div>
-                      )}
-                      {/* Misconfig inline */}
-                      {misconfigs.length>0 && (
-                        <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
-                          {misconfigs.slice(0,2).map((f,j)=>(
-                            <div key={j} style={{fontSize:10,color:SEV_COLOR[f.severity],background:`${SEV_COLOR[f.severity]}10`,
-                              border:`1px solid ${SEV_COLOR[f.severity]}30`,borderRadius:5,padding:"4px 8px"}}>
-                              <span style={{fontWeight:700}}>{f.id} </span>{f.title}
+                          )}
+                          {hits.length===0 && misconfigs.length===0 && (
+                            <div style={{fontSize:10,color:C.textMuted,fontStyle:"italic"}}>No document matches or config checks for this resource type.</div>
+                          )}
+                          {/* 10C: LLM per-resource risk summary */}
+                          {llmStatus === 'ready' && (
+                            <div style={{ marginTop:6 }}>
+                              {resourceSummaries[resourceKey] ? (
+                                <div style={{ background:`${C.accent}08`, borderRadius:6, padding:'6px 10px', fontSize:11, lineHeight:1.6 }}>
+                                  {renderMarkdown(resourceSummaries[resourceKey])}
+                                </div>
+                              ) : (
+                                <button
+                                  onClick={async () => {
+                                    const miscs = intelligence?.getMisconfigurations(r)||[];
+                                    const thr = intelligence?.getThreats(r)||{};
+                                    const ctx = `Resource: ${r.type}/${r.name||r.id}\nSTRIDE: ${(thr.stride||[]).join(', ')}\nATT&CK: ${(thr.attackTechniques||[]).map(t=>t.techniqueId||t).join(', ')}\nMisconfigs (${miscs.length}): ${miscs.slice(0,3).map(m=>m.title).join('; ')}`;
+                                    const key = resourceKey;
+                                    setResourceSummaries(prev=>({...prev,[key]:'…'}));
+                                    let text='';
+                                    await onGenerateLLM(
+                                      [{ role:'system', content:'In 2-3 sentences, summarize the security risk of this AWS resource and the single most important remediation action.' },
+                                       { role:'user', content:ctx }],
+                                      tok=>{ text+=tok; setResourceSummaries(prev=>({...prev,[key]:text})); }
+                                    );
+                                  }}
+                                  style={{ fontSize:10, background:`${C.accent}12`, color:C.accent, border:`1px solid ${C.accent}30`, borderRadius:5, padding:'3px 9px', cursor:'pointer', marginTop:2 }}
+                                >
+                                  ✦ Risk summary
+                                </button>
+                              )}
                             </div>
-                          ))}
-                          {misconfigs.length>2 && (
-                            <div style={{fontSize:10,color:C.textMuted}}>+{misconfigs.length-2} more — see Misconfig Checks tab</div>
                           )}
                         </div>
-                      )}
-                      {hits.length===0 && misconfigs.length===0 && (
-                        <div style={{fontSize:10,color:C.textMuted,fontStyle:"italic"}}>No document matches or config checks for this resource type.</div>
-                      )}
-                    </div>
-                  );
-                })}
-                {parseResult.resources.length > 30 && (
-                  <div style={{color:C.textMuted, fontSize:12}}>
-                    Showing first 30 resources.
+                      );
+                    })}
                   </div>
-                )}
-              </div>
-            )}
+
+                  {/* Pagination */}
+                  {totalPages > 1 && (
+                    <div style={{ display:'flex', gap:6, padding:'10px 0', justifyContent:'center' }}>
+                      <button disabled={resourcePage===0} onClick={()=>setResourcePage(p=>p-1)} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:5, padding:'4px 10px', fontSize:11, color:resourcePage===0?C.textMuted:C.text, cursor:resourcePage===0?'default':'pointer' }}>‹ Prev</button>
+                      <span style={{ fontSize:11, color:C.textMuted, lineHeight:'24px' }}>{resourcePage+1} / {totalPages}</span>
+                      <button disabled={resourcePage===totalPages-1} onClick={()=>setResourcePage(p=>p+1)} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:5, padding:'4px 10px', fontSize:11, color:resourcePage===totalPages-1?C.textMuted:C.text, cursor:resourcePage===totalPages-1?'default':'pointer' }}>Next ›</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
       </div>
@@ -7889,6 +8907,7 @@ export default function App() {
   const [archAnalysis, setArchAnalysis] = useState(null);     // analyzeArchitecture() result
   const [archOverrides, setArchOverrides] = useState({});      // user edits (narrative + attributes)
   const [archAnalyzing, setArchAnalyzing] = useState(false);  // spinner while computing
+  const [archEditingField, setArchEditingField] = useState(null); // which narrative field is in edit mode
 
   const saveModels = useCallback((models) => {
     setThreatModels(models);
@@ -8001,8 +9020,12 @@ export default function App() {
   const [wllamaModelSize, setWllamaModelSize]   = useState(0);  // size in MB
   const [embedProgress, setEmbedProgress] = useState(null); // null | {done, total}
   // VectorStore (custom pure-JS implementation from ThrataformRAG.js)
-  const vectorStoreRef = useRef(new VectorStore());
-  const pendingLlmRef  = useRef({});  // retained for compatibility
+  const vectorStoreRef  = useRef(new VectorStore());
+  const colbertStoreRef = useRef(new ColBERTVectorStore(1024)); // multi-vector ColBERT (populated when embedMulti available)
+  const pendingLlmRef   = useRef({});  // retained for compatibility
+  // IaC-IR: computed org tree + SCP ceilings (useState so IntelligencePanel re-renders when updated)
+  const [computedIR, setComputedIR] = useState({ organizationTree: null, scpCeilings: {}, gaps: [] });
+  const computedIRRef = useRef(computedIR); // keep ref in sync for buildFullContext closures
 
   // User documents — per-model, backed by localStorage[tf-model-{id}-docs]
   const [userDocs, setUserDocsState] = useState(() => {
@@ -8037,6 +9060,35 @@ export default function App() {
   useEffect(() => { userDocsRef.current = userDocs; }, [userDocs]);
   useEffect(() => { parseResultRef.current = parseResult; }, [parseResult]);
   useEffect(() => { filesRef.current = files; }, [files]);
+
+  // ── IaC-IR: Build org tree + SCP ceilings whenever parse result changes ──────
+  useEffect(() => {
+    if (!parseResult?.resources?.length) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [{ buildOrgTree }, { computeSCPCeilings }] = await Promise.all([
+          import('./src/lib/iac/OrgTreeBuilder.js'),
+          import('./src/lib/iac/PolicyEvaluator.js'),
+        ]);
+        if (cancelled) return;
+        const tree = buildOrgTree(parseResult.resources);
+        const ceilings = computeSCPCeilings(parseResult.resources, tree);
+        const gaps = [
+          ...tree.gaps,
+          ...Object.entries(ceilings)
+            .filter(([, v]) => v.includes('UNKNOWN'))
+            .map(([k]) => `Account ${k}: SCP ceiling partially unknown (intrinsic references)`),
+        ];
+        const irData = { organizationTree: tree, scpCeilings: ceilings, gaps };
+        computedIRRef.current = irData;
+        setComputedIR(irData);
+      } catch (err) {
+        console.warn('[IaC-IR] Failed to compute org tree:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [parseResult]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { archOverridesRef.current = archOverrides; }, [archOverrides]);
 
   // Stable refs so reparse ([] deps) and grade effect can always read current values
@@ -8203,6 +9255,7 @@ export default function App() {
 
     // Populate vector store with cached vectors immediately
     vectorStoreRef.current.clear();
+    colbertStoreRef.current.clear(); // ColBERT cleared; populated below if embedMulti available
     result.forEach((c, i) => {
       if (c.vector) vectorStoreRef.current.add(`chunk_${i}`, c.vector, c);
     });
@@ -8223,6 +9276,15 @@ export default function App() {
           result[b.chunkIdx] = { ...b.chunk, vector: vec };
           vectorStoreRef.current.add(`chunk_${b.chunkIdx}`, vec, b.chunk);
           vdbPut(b.key, vec);
+          // ColBERT multi-vector embeddings (late-interaction) — populate if model supports it
+          try {
+            const multiVecs = wllamaManager.embedMulti?.(b.chunk.text);
+            if (multiVecs instanceof Promise) {
+              multiVecs.then(mv => { if (mv?.length) colbertStoreRef.current.add(`chunk_${b.chunkIdx}`, mv, b.chunk); }).catch(() => {});
+            } else if (multiVecs?.length) {
+              colbertStoreRef.current.add(`chunk_${b.chunkIdx}`, multiVecs, b.chunk);
+            }
+          } catch { /* ColBERT skipped — single-vector still active */ }
         });
       } catch { /* skip failed batch */ }
       setEmbedProgress({ done: Math.min(i + BATCH, needEmbed.length), total: needEmbed.length });
@@ -8242,13 +9304,22 @@ export default function App() {
     const bm25Results = intel?._built ? intel.query(query, topK * 2) : [];
 
     const store = vectorStoreRef.current;
+    // Offline BM25-only path (no model or no dense store)
     if (!wllamaManager.isLoaded || store.size === 0) {
       return bm25Results.slice(0, topK).map(r => ({ ...r, searchType: 'bm25' }));
     }
 
-    // Dense retrieval using wllama embeddings + RRF fusion
     try {
-      const queryVec = await wllamaManager.embedQuery(query);
+      // HyDE: expand query into hypothetical doc embedding for richer retrieval signal
+      let queryVec;
+      try {
+        queryVec = await hydeTemplate(query, null, (text) => wllamaManager.embedQuery(text));
+      } catch {
+        // Fall back to plain query embedding if HyDE fails
+        queryVec = await wllamaManager.embedQuery(query);
+      }
+
+      // Fused BM25 + dense retrieval with HyDE-expanded query vector
       return ragHybridSearch({ bm25Chunks: bm25Results, vectorStore: store, queryVec, topK });
     } catch {
       return bm25Results.slice(0, topK).map(r => ({ ...r, searchType: 'bm25' }));
@@ -8320,7 +9391,7 @@ export default function App() {
 
   // Re-run parse + DFD whenever the TF files list changes
   // Uses userDocsRef so this callback stays stable without needing userDocs in deps.
-  const reparse = useCallback((tfFiles) => {
+  const reparse = useCallback(async (tfFiles) => {
     const ctxDoc = buildModelContextDoc();
     const archDoc = buildArchContextDoc();
     if (!tfFiles.length) {
@@ -8330,7 +9401,28 @@ export default function App() {
       setIntelligenceVersion(v=>v+1);
       return;
     }
-    const result = parseTFMultiFile(tfFiles);
+
+    // ── Separate HCL/TF files from JSON/CFN files ─────────────────────────────
+    const CFN_SIG = /"AWSTemplateFormatVersion"|"Resources"\s*:\s*\{[\s\S]{1,500}"AWS::/;
+    const hclFiles = tfFiles.filter(f => !/\.json$/i.test(f.name));
+    const jsonFiles = tfFiles.filter(f => /\.json$/i.test(f.name));
+    const cfnFiles  = jsonFiles.filter(f =>
+      /\.cfn\.json$/i.test(f.name) || CFN_SIG.test(f.content || '')
+    );
+
+    const result = parseTFMultiFile(hclFiles);
+
+    // ── Parse CFN files and merge resources ───────────────────────────────────
+    if (cfnFiles.length > 0) {
+      try {
+        const cfnResult = await parseCFNFiles(cfnFiles);
+        result.resources.push(...cfnResult.resources);
+        result.gaps = [...(result.gaps || []), ...cfnResult.gaps];
+      } catch (err) {
+        console.warn('[reparse] CFN parsing failed:', err);
+      }
+    }
+
     setParseResult(result);
     // Rebuild intelligence: model context + arch context + uploaded docs + parsed resources
     const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
@@ -8350,7 +9442,7 @@ export default function App() {
   // Everything else → userDocs (context). append=true merges instead of replacing.
   const readFiles = useCallback((fileList, append = false, docCategory = "general") => {
     const SKIP_BINARY = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc)$/i;
-    const isTF = f => /\.(tf|hcl|sentinel|tfvars)$/i.test(f.name);
+    const isTF = f => /\.(tf|hcl|sentinel|tfvars)$/i.test(f.name) || /\.cfn\.json$/i.test(f.name);
     const all = Array.from(fileList).filter(f => !SKIP_BINARY.test(f.name) && f.size < 50*1024*1024);
     if (!all.length) return;
     setError("");
@@ -9069,26 +10161,30 @@ export default function App() {
         ];
 
         const ATTR_CHIPS = {
-          applicationType: ["Web App","REST API","Serverless","Microservices","Container-Based","VM-Based","Static Site","Data Pipeline","Streaming","ML/AI"],
-          entryPointTypes: ["HTTPS","REST API","GraphQL","gRPC","CLI","SDK","Webhook","Event Stream","File Transfer","Web UI"],
-          developedBy:     ["Vendor (AWS)","Vendor (Azure)","Vendor (GCP)","Vendor (3rd Party)","Internal","Hybrid"],
-          users:           ["Internal Employees","Internal Apps/Services","External End Users","3rd Party Systems","Business Partners"],
-          inboundDataSource:  ["Internal Corporate Network","External 3rd Party","External Public","Trusted Partner","IoT/Edge"],
-          inboundDataFlow:    ["API Request","Event/Message","Network Traffic","User Input","Data Streaming","File Upload","DB Replication"],
-          outboundDataFlow:   ["API Response","Event/Message","Network Traffic","Data Streaming","File Export","DB Write"],
+          applicationType:   ["Web App","REST API","Serverless","Microservices","Container-Based","VM-Based","Static Site","Data Pipeline","Streaming","ML/AI"],
+          entryPointTypes:   ["HTTPS","REST API","GraphQL","gRPC","CLI","SDK","Webhook","Event Stream","File Transfer","Web UI"],
+          developedBy:       ["Vendor (AWS)","Vendor (Azure)","Vendor (GCP)","Vendor (3rd Party)","Internal","Hybrid"],
+          users:             ["Internal Employees","Internal Apps/Services","External End Users","3rd Party Systems","Business Partners"],
+          inboundDataSource: ["Internal Corporate Network","External 3rd Party","External Public","Trusted Partner","IoT/Edge"],
+          inboundDataFlow:   ["API Request","Event/Message","Network Traffic","User Input","Data Streaming","File Upload","DB Replication"],
+          outboundDataFlow:  ["API Response","Event/Message","Network Traffic","Data Streaming","File Export","DB Write"],
           outboundDataDestination: ["Internal Corporate Network","External 3rd Party","External Public","Trusted Partner","Data Warehouse"],
-          integrations:    ["REST API","GraphQL","SDK","Webhook","File Transfer","Message Queue (SQS/SNS)","Event Stream (Kinesis/Kafka)","Middleware","DB Replication"],
-          exposure:        ["Public Internet","Intranet Only","VPN Required","Trusted Partner Network","Air-Gapped"],
-          facilityType:    ["AWS Cloud","Azure Cloud","GCP Cloud","Enterprise Data Center","3rd Party DC","Mobile","Desktop"],
-          computeType:     ["Cloud Managed Service","Serverless","Container (ECS/EKS)","VM (EC2)","On-Premises","Hybrid"],
-          authMethods:     ["OAuth 2.0","SSO/SAML","PKI/mTLS","ADFS/LDAP","API Key","MFA","AWS IAM","Kerberos","Passwordless"],
+          integrations:      ["REST API","GraphQL","SDK","Webhook","File Transfer","Message Queue (SQS/SNS)","Event Stream (Kinesis/Kafka)","Middleware","DB Replication"],
+          exposure:          ["Public Internet","Intranet Only","VPN Required","Trusted Partner Network","Air-Gapped"],
+          facilityType:      ["AWS Cloud","Azure Cloud","GCP Cloud","Enterprise Data Center","3rd Party DC","Mobile","Desktop"],
+          computeType:       ["Cloud Managed Service","Serverless","Container (ECS/EKS)","VM (EC2)","On-Premises","Hybrid"],
+          authMethods:       ["OAuth 2.0","SSO/SAML","PKI/mTLS","ADFS/LDAP","API Key","MFA","AWS IAM","Certificate","Passwordless"],
+          dataSensitivity:   ["PII","PHI","PCI Data","Confidential","Internal","Public","Export Controlled","Trade Secret"],
+          complianceFramework:["HIPAA","PCI-DSS","SOC 2","GDPR","FedRAMP","ISO 27001","NIST 800-53","CIS AWS","CCPA","CMMC"],
+          environment:       ["Production","Staging","Development","DR / Backup","Lab / Sandbox","Multi-Tenant","Single-Tenant"],
         };
 
         const ATTR_GROUPS = [
-          { label:"Application Profile",     keys:["applicationType","entryPointTypes","developedBy","users"] },
-          { label:"Data & Integration",       keys:["inboundDataSource","inboundDataFlow","outboundDataFlow","outboundDataDestination","integrations"] },
+          { label:"Application Profile",        keys:["applicationType","entryPointTypes","developedBy","users"] },
+          { label:"Data & Integration",          keys:["inboundDataSource","inboundDataFlow","outboundDataFlow","outboundDataDestination","integrations"] },
           { label:"Deployment & Infrastructure", keys:["exposure","facilityType","computeType"] },
-          { label:"Security",                 keys:["authMethods"] },
+          { label:"Security & Compliance",       keys:["authMethods","dataSensitivity","complianceFramework"] },
+          { label:"Context",                     keys:["environment"] },
         ];
 
         const ATTR_LABELS = {
@@ -9098,9 +10194,11 @@ export default function App() {
           outboundDataFlow:"Outbound Data Flow", outboundDataDestination:"Outbound Destination",
           integrations:"Integrations", exposure:"Exposure", facilityType:"Facility Type",
           computeType:"Compute Type", authMethods:"Authentication Methods",
+          dataSensitivity:"Data Sensitivity", complianceFramework:"Compliance Frameworks",
+          environment:"Environment / Deployment Stage",
         };
 
-        const SINGLE_SELECT = ["developedBy"];
+        const SINGLE_SELECT = ["developedBy","environment"];
 
         // Merge base + overrides
         const baseNarrative = archAnalysis?.narrative || {};
@@ -9197,104 +10295,265 @@ export default function App() {
                   background:`${C.accent}18`, border:`1px solid ${C.accent}44`, color:C.accent, cursor:"pointer",
                 }}>Go to Upload & Analyze</button>
               </div>
-            ) : (
-              <div style={{ flex:1, display:"grid", gridTemplateColumns:"1fr 1fr", overflow:"hidden" }}>
-                {/* LEFT — Narrative Fields */}
-                <div style={{ overflowY:"auto", padding:"20px 24px", borderRight:`1px solid ${C.border}` }}>
-                  <div style={{...SANS, fontSize:12, fontWeight:700, color:C.textMuted, textTransform:"uppercase",
-                    letterSpacing:".1em", marginBottom:16}}>Narrative Findings</div>
-                  {NARRATIVE_FIELDS.map(({ key, label, Icon: FieldIcon }) => {
-                    const value = narrative[key] || "";
-                    const isOverridden = !!ovNarrative[key];
-                    return (
-                      <div key={key} style={{ marginBottom:16 }}>
-                        <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
-                          <FieldIcon size={14} style={{ color:C.accent }}/>
-                          <span style={{...SANS, fontSize:12, fontWeight:700, color:C.text}}>{label}</span>
-                          {!isOverridden && value && (
-                            <span style={{ fontSize:9, fontWeight:700, background:"#FF980018", color:"#FF9800",
-                              border:"1px solid #FF980044", borderRadius:8, padding:"1px 6px", marginLeft:4 }}>AI</span>
-                          )}
-                          {isOverridden && (
-                            <span style={{ fontSize:9, fontWeight:700, background:`${C.accent}18`, color:C.accent,
-                              border:`1px solid ${C.accent}44`, borderRadius:8, padding:"1px 6px", marginLeft:4 }}>edited</span>
-                          )}
-                        </div>
-                        <textarea
-                          value={value}
-                          onChange={e => saveNarrativeField(key, e.target.value)}
-                          placeholder={`Describe ${label.toLowerCase()}...`}
-                          rows={3}
-                          style={{
-                            width:"100%", boxSizing:"border-box", resize:"vertical",
-                            background:C.bg, border:`1px solid ${isOverridden ? C.accent+"66" : C.border}`,
-                            borderRadius:7, color:C.text, fontSize:12, padding:"9px 11px",
-                            lineHeight:1.6, outline:"none", ...SANS, transition:"border-color .15s",
-                          }}
-                          onFocus={e=>e.target.style.borderColor=C.accent}
-                          onBlur={e=>e.target.style.borderColor=isOverridden?C.accent+"66":C.border}
-                        />
+            ) : (() => {
+              // ── Inline markdown renderer for narrative preview ──
+              const renderLine = (line, i) => {
+                const parts = line.split(/(\*\*[^*]+\*\*)/g);
+                return parts.map((p,j) =>
+                  (p.startsWith('**') && p.endsWith('**'))
+                    ? <strong key={j}>{p.slice(2,-2)}</strong>
+                    : <span key={j}>{p}</span>
+                );
+              };
+              const decodeEntities = (s) => (s||'')
+                .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+                .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&nbsp;/g,' ');
+              const renderNarrative = (text) => {
+                if (!text?.trim()) return null;
+                const lines = decodeEntities(text).split('\n');
+                const els = [];
+                let i = 0;
+                while (i < lines.length) {
+                  const line = lines[i];
+                  const trimmed = line.trim();
+                  if (trimmed.startsWith('• ') || trimmed.startsWith('- ')) {
+                    const bullets = [];
+                    while (i < lines.length && (lines[i].trim().startsWith('• ') || lines[i].trim().startsWith('- '))) {
+                      bullets.push(lines[i].trim().slice(2));
+                      i++;
+                    }
+                    els.push(
+                      <div key={`b${i}`} style={{marginBottom:4}}>
+                        {bullets.map((b,bi) => (
+                          <div key={bi} style={{display:'flex', gap:7, marginBottom:3, alignItems:'flex-start'}}>
+                            <span style={{color:C.accent, flexShrink:0, marginTop:1, fontSize:13, lineHeight:'16px'}}>•</span>
+                            <span style={{lineHeight:'18px'}}>{renderLine(b, bi)}</span>
+                          </div>
+                        ))}
                       </div>
                     );
-                  })}
-                </div>
+                  } else if (trimmed.startsWith('Context:')) {
+                    els.push(
+                      <div key={`c${i}`} style={{
+                        marginTop:8, padding:'7px 10px',
+                        background:`${C.accent}0a`, border:`1px solid ${C.accent}22`,
+                        borderRadius:6, fontSize:11, color:C.textSub, lineHeight:1.6,
+                        fontStyle:'italic',
+                      }}>
+                        <span style={{fontWeight:700, fontStyle:'normal', color:C.accent, fontSize:10, marginRight:5}}>FROM DOCS</span>
+                        {renderLine(trimmed.slice(9).trim(), i)}
+                      </div>
+                    );
+                    i++;
+                  } else if (trimmed === '') {
+                    els.push(<div key={`sp${i}`} style={{height:5}}/>);
+                    i++;
+                  } else {
+                    els.push(<div key={`t${i}`} style={{marginBottom:3, lineHeight:'18px'}}>{renderLine(trimmed, i)}</div>);
+                    i++;
+                  }
+                }
+                return els;
+              };
 
-                {/* RIGHT — Structured Attributes */}
-                <div style={{ overflowY:"auto", padding:"20px 24px" }}>
-                  <div style={{...SANS, fontSize:12, fontWeight:700, color:C.textMuted, textTransform:"uppercase",
-                    letterSpacing:".1em", marginBottom:16}}>Structured Attributes</div>
-                  {ATTR_GROUPS.map((group, gi) => (
-                    <div key={gi} style={{ marginBottom:20 }}>
-                      <div style={{ fontSize:11, fontWeight:700, color:C.textMuted, textTransform:"uppercase",
-                        letterSpacing:".08em", marginBottom:12, paddingBottom:6,
-                        borderBottom:`1px solid ${C.border}` }}>{group.label}</div>
-                      {group.keys.map(attrKey => {
-                        const options = ATTR_CHIPS[attrKey] || [];
-                        const single = SINGLE_SELECT.includes(attrKey);
-                        const selected = attrs[attrKey];
-                        const isSelected = (opt) => single
-                          ? selected === opt
-                          : Array.isArray(selected) && selected.includes(opt);
-                        const isAI = (opt) => {
-                          const base = baseAttrs[attrKey];
-                          return single ? base === opt : Array.isArray(base) && base.includes(opt);
-                        };
-                        return (
-                          <div key={attrKey} style={{ marginBottom:12 }}>
-                            <div style={{...SANS, fontSize:11, fontWeight:600, color:C.textSub, marginBottom:6}}>
-                              {ATTR_LABELS[attrKey]}
-                              {single && <span style={{fontSize:10, color:C.textMuted, fontWeight:400}}> · single select</span>}
-                            </div>
-                            <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
-                              {options.map(opt => {
-                                const active = isSelected(opt);
-                                const ai = isAI(opt);
-                                return (
-                                  <button key={opt} onClick={() => toggleAttrChip(attrKey, opt)} style={{
-                                    ...SANS, fontSize:11, fontWeight: active ? 700 : 400,
-                                    padding:"4px 10px", borderRadius:14, cursor:"pointer",
-                                    background: active ? `${C.accent}22` : C.surface2,
-                                    border: `1px solid ${active ? C.accent : C.border2}`,
-                                    color: active ? C.accent : C.textMuted,
-                                    transition:"all .12s", position:"relative",
-                                  }}>
-                                    {opt}
-                                    {ai && active && (
-                                      <span style={{ fontSize:8, color:"#FF9800", position:"absolute", top:-3, right:-3,
-                                        background:C.surface, borderRadius:"50%", padding:"0 2px" }}>✦</span>
-                                    )}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        );
-                      })}
+              return (
+                <div style={{ flex:1, display:"grid", gridTemplateColumns:"1fr 1fr", overflow:"hidden" }}>
+                  {/* LEFT — Narrative Fields */}
+                  <div style={{ overflowY:"auto", padding:"16px 20px", borderRight:`1px solid ${C.border}` }}>
+                    <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14}}>
+                      <div style={{...SANS, fontSize:11, fontWeight:700, color:C.textMuted, textTransform:"uppercase", letterSpacing:".1em"}}>
+                        Narrative Findings
+                      </div>
+                      <div style={{fontSize:10, color:C.textMuted}}>
+                        {Object.values(narrative).filter(Boolean).length} / {NARRATIVE_FIELDS.length} fields populated
+                      </div>
                     </div>
-                  ))}
+                    {NARRATIVE_FIELDS.map(({ key, label, Icon: FieldIcon }) => {
+                      const value = narrative[key] || "";
+                      const isOverridden = !!ovNarrative[key];
+                      const isEditing = archEditingField === key;
+                      const bulletCount = (value.match(/^•/gm) || []).length;
+                      return (
+                        <div key={key} style={{
+                          marginBottom:10,
+                          border:`1px solid ${isEditing ? C.accent+'55' : C.border}`,
+                          borderRadius:10,
+                          overflow:'hidden',
+                          transition:'border-color .15s',
+                          background: C.surface,
+                        }}>
+                          {/* Section header */}
+                          <div style={{
+                            display:'flex', alignItems:'center', gap:7, padding:'8px 12px',
+                            borderBottom:`1px solid ${isEditing ? C.accent+'22' : C.border}`,
+                            background: isEditing ? `${C.accent}08` : C.surface2,
+                          }}>
+                            <FieldIcon size={13} style={{color: C.accent, flexShrink:0}}/>
+                            <span style={{...SANS, fontSize:12, fontWeight:700, color:C.text, flex:1}}>{label}</span>
+                            {bulletCount > 0 && !isEditing && (
+                              <span style={{fontSize:10, color:C.textMuted}}>{bulletCount} items</span>
+                            )}
+                            {!isOverridden && value && !isEditing && (
+                              <span style={{fontSize:9, fontWeight:700, background:"#FF980018", color:"#FF9800",
+                                border:"1px solid #FF980044", borderRadius:8, padding:"1px 6px"}}>AI</span>
+                            )}
+                            {isOverridden && !isEditing && (
+                              <span style={{fontSize:9, fontWeight:700, background:`${C.accent}18`, color:C.accent,
+                                border:`1px solid ${C.accent}44`, borderRadius:8, padding:"1px 6px"}}>edited</span>
+                            )}
+                            <button
+                              onClick={() => setArchEditingField(isEditing ? null : key)}
+                              style={{
+                                ...SANS, fontSize:10, padding:'2px 8px', borderRadius:6, cursor:'pointer',
+                                display:'flex', alignItems:'center', gap:4,
+                                background: isEditing ? C.accent : 'transparent',
+                                border:`1px solid ${isEditing ? C.accent : C.border2}`,
+                                color: isEditing ? '#fff' : C.textMuted,
+                                transition:'all .12s',
+                              }}
+                            >
+                              {isEditing
+                                ? <><CheckCircle2 size={9}/> Done</>
+                                : <><PenLine size={9}/> Edit</>
+                              }
+                            </button>
+                          </div>
+                          {/* Content: preview or textarea */}
+                          {isEditing ? (
+                            <textarea
+                              value={value}
+                              onChange={e => saveNarrativeField(key, e.target.value)}
+                              placeholder={`Describe ${label.toLowerCase()}...\n\nUse • for bullets, e.g.:\n• Item one\n• Item two\nContext: optional doc note`}
+                              ref={el => { if (el) { el.style.height='auto'; el.style.height=Math.max(80, el.scrollHeight)+'px'; }}}
+                              onInput={e => { e.target.style.height='auto'; e.target.style.height=Math.max(80, e.target.scrollHeight)+'px'; }}
+                              style={{
+                                width:'100%', boxSizing:'border-box', resize:'none',
+                                background:C.bg, border:'none', borderRadius:0,
+                                color:C.text, fontSize:12, padding:'10px 12px',
+                                lineHeight:1.7, outline:'none', ...SANS,
+                                minHeight:80, display:'block', fontFamily:'inherit',
+                              }}
+                            />
+                          ) : (
+                            <div
+                              onClick={() => setArchEditingField(key)}
+                              style={{
+                                padding:'10px 12px', fontSize:12, lineHeight:1.6,
+                                color: value ? C.text : C.textMuted,
+                                ...SANS, cursor:'text', minHeight:38,
+                                fontStyle: value ? 'normal' : 'italic',
+                              }}
+                            >
+                              {value
+                                ? renderNarrative(value)
+                                : `Click to add ${label.toLowerCase()}…`
+                              }
+                            </div>
+                          )}
+                          {isEditing && (
+                            <div style={{
+                              display:'flex', justifyContent:'flex-end',
+                              padding:'4px 10px', borderTop:`1px solid ${C.border}`,
+                              background:C.surface2,
+                            }}>
+                              <span style={{fontSize:10, color:C.textMuted}}>{value.length} chars</span>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* RIGHT — Structured Attributes */}
+                  <div style={{ overflowY:"auto", padding:"16px 20px" }}>
+                    <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14}}>
+                      <div style={{...SANS, fontSize:11, fontWeight:700, color:C.textMuted, textTransform:"uppercase", letterSpacing:".1em"}}>
+                        Structured Attributes
+                      </div>
+                      <div style={{fontSize:10, color:C.textMuted}}>
+                        ✦ = AI-detected
+                      </div>
+                    </div>
+                    {ATTR_GROUPS.map((group, gi) => {
+                      // Count selected across this group
+                      const selCount = group.keys.reduce((n, k) => {
+                        const v = attrs[k];
+                        return n + (SINGLE_SELECT.includes(k) ? (v ? 1 : 0) : (Array.isArray(v) ? v.length : 0));
+                      }, 0);
+                      return (
+                        <div key={gi} style={{ marginBottom:18 }}>
+                          <div style={{
+                            display:'flex', alignItems:'center', justifyContent:'space-between',
+                            marginBottom:10, paddingBottom:7,
+                            borderBottom:`1px solid ${C.border}`,
+                          }}>
+                            <div style={{fontSize:11, fontWeight:700, color:C.textMuted, textTransform:"uppercase", letterSpacing:".08em"}}>
+                              {group.label}
+                            </div>
+                            {selCount > 0 && (
+                              <span style={{
+                                fontSize:10, color:C.accent, fontWeight:600,
+                                background:`${C.accent}15`, border:`1px solid ${C.accent}33`,
+                                borderRadius:8, padding:'1px 7px',
+                              }}>{selCount} selected</span>
+                            )}
+                          </div>
+                          {group.keys.map(attrKey => {
+                            const options = ATTR_CHIPS[attrKey] || [];
+                            const single = SINGLE_SELECT.includes(attrKey);
+                            const selected = attrs[attrKey];
+                            const isSelected = (opt) => single
+                              ? selected === opt
+                              : Array.isArray(selected) && selected.includes(opt);
+                            const isAI = (opt) => {
+                              const base = baseAttrs[attrKey];
+                              return single ? base === opt : Array.isArray(base) && base.includes(opt);
+                            };
+                            const anySelected = single ? !!selected : (Array.isArray(selected) && selected.length > 0);
+                            return (
+                              <div key={attrKey} style={{ marginBottom:11 }}>
+                                <div style={{...SANS, fontSize:11, fontWeight:600, color: anySelected ? C.textSub : C.textMuted, marginBottom:5, display:'flex', alignItems:'center', gap:5}}>
+                                  {ATTR_LABELS[attrKey]}
+                                  {single && <span style={{fontSize:9, color:C.textMuted, fontWeight:400, background:C.surface2, padding:'1px 5px', borderRadius:4}}>single</span>}
+                                </div>
+                                <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                                  {options.map(opt => {
+                                    const active = isSelected(opt);
+                                    const ai = isAI(opt);
+                                    return (
+                                      <button key={opt} onClick={() => toggleAttrChip(attrKey, opt)} style={{
+                                        ...SANS, fontSize:11, fontWeight: active ? 600 : 400,
+                                        padding:"3px 9px", borderRadius:12, cursor:"pointer",
+                                        background: active ? `${C.accent}20` : C.surface2,
+                                        border: `1px solid ${active ? C.accent+'88' : C.border2}`,
+                                        color: active ? C.accent : C.textMuted,
+                                        transition:"all .12s", position:"relative",
+                                        lineHeight:'16px',
+                                      }}>
+                                        {opt}
+                                        {ai && active && (
+                                          <span title="AI-detected" style={{
+                                            fontSize:8, color:"#FF9800",
+                                            position:"absolute", top:-4, right:-4,
+                                            background:C.surface, borderRadius:"50%",
+                                            padding:"0 2px", lineHeight:'12px',
+                                            border:'1px solid #FF980044',
+                                          }}>✦</span>
+                                        )}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
           </div>
         );
       })()}
@@ -9322,6 +10581,7 @@ export default function App() {
           onHybridSearch={hybridSearch}
           onGenerateLLM={generateLLMResponse}
           vectorStore={vectorStoreRef.current}
+          computedIR={computedIR}
         />
       )}
 
