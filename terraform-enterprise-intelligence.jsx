@@ -9,18 +9,18 @@ import { hydeTemplate } from './src/lib/rag/HyDE.js';
 import { ColBERTVectorStore } from './src/lib/rag/VectorStore.js';
 import { mcpRegistry } from './src/lib/mcp/MCPToolRegistry.js';
 import {
-  BookOpen, Upload, Brain, Microscope, Map as MapIcon, Building2, Search, ShieldCheck,
+  BookOpen, Upload, Brain, Microscope, MapIcon, Building2, Search, ShieldCheck,
   ListChecks, GitCompare, ShieldAlert, Zap, TriangleAlert, ScanLine, Layers,
-  Image as ImageIcon, BarChart2, Code2, BookMarked, LayoutList, ChevronLeft,
+  ImageIcon, BarChart2, Code2, BookMarked, LayoutList, ChevronLeft,
   ArrowRight, Trash2, FolderOpen, Loader2, AppWindow, Sparkles, Shield, Cloud,
   ClipboardList, Lock, SquareStack, DoorOpen, ArrowLeftRight, Globe, RefreshCw,
-  KeyRound, Link as LinkIcon, Database, FileText, ChevronDown, ChevronRight,
+  KeyRound, LinkIcon, Database, FileText, ChevronDown, ChevronRight,
   CheckCircle2, AlertCircle, Plus, X, Home, Settings, Info, Eye, EyeOff,
   BarChart, TrendingUp, Target, Activity, ArrowUpRight, CheckSquare, Square,
   PenLine, RotateCcw, Cpu, Server, Network, HardDrive, Users, Plug,
   Download, XCircle, CheckCircle, Package,
   Bot, MessageSquare, Send, StopCircle, ChevronUp,
-} from "lucide-react";
+} from "./src/icons.jsx";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENTERPRISE TERRAFORM ARCHITECTURE INTELLIGENCE PLATFORM  v1.0
