@@ -1,0 +1,204 @@
+# naming-convention.sentinel
+# Layer 5 — Security Controls: Resource naming validation
+# Validates resource naming follows enterprise-{type}-{env} pattern
+# Category: naming — governance/tagging
+
+import "tfplan/v2" as tfplan
+import "tfconfig/v2" as tfconfig
+import "strings"
+import "regex"
+
+# Enterprise naming convention:
+# Resources: {prefix}-{resource-type}-{identifier}
+# Examples:  enterprise-vpc-prod-001, platform-sg-trading-app, enterprise-kms-data-001
+
+# ── Allowed prefixes ───────────────────────────────────────────────────────────
+
+allowed_prefixes = [
+  "enterprise",
+  "platform",
+  "shared",
+  "mgmt",
+  "corp",
+  "cib",    # Capital Investment Banking
+  "atlas",  # Platform codename
+]
+
+# ── Naming pattern by resource type ───────────────────────────────────────────
+# Maps resource type → expected name_regex pattern
+
+naming_patterns = {
+  "aws_vpc":                    "^(enterprise|platform|shared|mgmt)-(vpc)-[a-z0-9-]+$",
+  "aws_subnet":                 "^(enterprise|platform|shared|mgmt)-(subnet)-[a-z0-9-]+$",
+  "aws_security_group":         "^(enterprise|platform|shared|mgmt)-(sg)-[a-z0-9-]+$",
+  "aws_kms_key_alias":          "alias/(enterprise|platform|shared)-[a-z0-9-]+",
+  "aws_iam_role":               "^(enterprise|platform|controlplane|workload)-[a-z0-9-]+-role(-[a-z]+)?$",
+  "aws_iam_policy":             "^(enterprise|platform|controlplane|workload)-[a-z0-9-]+-policy(-[a-z]+)?$",
+  "aws_cloudwatch_log_group":   "^/(enterprise|platform|app|aws)/[a-z0-9-/]+$",
+  "aws_cloudwatch_metric_alarm": "^(enterprise|platform)-[a-z0-9-]+$",
+  "aws_dynamodb_table":         "^(enterprise|platform)-[a-z0-9-]+-[a-z]+$",
+  "aws_ec2_transit_gateway":    "^(enterprise|platform)-(tgw)-[a-z0-9-]+$",
+  "aws_db_subnet_group":        "^(enterprise|platform)-db-subnet-group-[a-z0-9-]+$",
+  "aws_elasticache_subnet_group": "^(enterprise|platform)-(cache|elasticache)-subnet-group-[a-z0-9-]+$",
+}
+
+# ── Environment tag validation ─────────────────────────────────────────────────
+
+environment_name_map = {
+  "production":  "prod",
+  "staging":     "stg",
+  "development": "dev",
+  "sandbox":     "sbx",
+  "management":  "mgmt",
+}
+
+# ── Name checker ──────────────────────────────────────────────────────────────
+
+check_naming = func(address, rc, pattern) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+
+  name = after.name else after.alias_name else null
+
+  if name is null or name is "" {
+    return violations  # No name to check
+  }
+
+  if not regex.match(pattern, name) {
+    violations = append(violations, {
+      "resource": address,
+      "name":     name,
+      "pattern":  pattern,
+      "severity": "warning",
+      "message":  "Resource name '" + name + "' does not match enterprise naming convention: " + pattern,
+    })
+  }
+
+  # Check for use of capital letters (banned in resource names)
+  if name != strings.to_lower(name) {
+    violations = append(violations, {
+      "resource": address,
+      "name":     name,
+      "severity": "error",
+      "message":  "Resource name must be lowercase: " + name,
+    })
+  }
+
+  # Check for spaces or special chars
+  if regex.match("[^a-z0-9\\-_/.]", name) {
+    violations = append(violations, {
+      "resource": address,
+      "name":     name,
+      "severity": "error",
+      "message":  "Resource name contains invalid characters (only a-z, 0-9, -, _, /, . allowed): " + name,
+    })
+  }
+
+  return violations
+}
+
+# Check IAM resource naming pattern: {service}-{function}-{role|policy}
+check_iam_naming = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  name = after.name else null
+  if name is null { return violations }
+
+  # IAM names should follow the pattern
+  if not strings.has_prefix(name, "enterprise-") and
+     not strings.has_prefix(name, "platform-") and
+     not strings.has_prefix(name, "controlplane-") and
+     not strings.has_prefix(name, "workload-") and
+     not strings.has_prefix(name, "aws-") and
+     not strings.has_prefix(name, "AWSControlTower") {
+    violations = append(violations, {
+      "resource": address,
+      "name":     name,
+      "severity": "warning",
+      "message":  "IAM resource name should start with enterprise-|platform-|controlplane-|workload-: " + name,
+    })
+  }
+
+  return violations
+}
+
+# Check S3 bucket naming — must include account ID suffix for global uniqueness
+check_s3_naming = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  bucket = after.bucket else null
+  if bucket is null { return violations }
+
+  # S3 buckets: must start with enterprise- or platform-
+  if not strings.has_prefix(bucket, "enterprise-") and
+     not strings.has_prefix(bucket, "platform-") and
+     not strings.has_prefix(bucket, "shared-") {
+    violations = append(violations, {
+      "resource": address,
+      "name":     bucket,
+      "severity": "warning",
+      "message":  "S3 bucket should start with enterprise-|platform-|shared-: " + bucket,
+    })
+  }
+
+  # S3 buckets must not contain dots (SSL certificate wildcards)
+  if strings.contains(bucket, ".") {
+    violations = append(violations, {
+      "resource": address,
+      "name":     bucket,
+      "severity": "error",
+      "message":  "S3 bucket name must not contain dots (breaks SSL): " + bucket,
+    })
+  }
+
+  return violations
+}
+
+# ── Main evaluation ────────────────────────────────────────────────────────────
+
+all_violations = []
+
+for tfplan.resource_changes as address, rc {
+  if rc.mode is "managed" and (rc.change.actions contains "create" or rc.change.actions contains "update") {
+    resource_type = strings.split(address, ".")[0]
+
+    if resource_type in naming_patterns {
+      pattern    = naming_patterns[resource_type]
+      violations = check_naming(address, rc, pattern)
+      all_violations = all_violations + violations
+    }
+
+    if resource_type in ["aws_iam_role", "aws_iam_policy", "aws_iam_instance_profile"] {
+      violations = check_iam_naming(address, rc)
+      all_violations = all_violations + violations
+    }
+
+    if resource_type is "aws_s3_bucket" {
+      violations = check_s3_naming(address, rc)
+      all_violations = all_violations + violations
+    }
+  }
+}
+
+error_violations   = filter all_violations as v { v.severity is "error" }
+warning_violations = filter all_violations as v { v.severity is "warning" }
+
+print("=== Naming Convention Policy ===")
+print("Total naming violations:", length(all_violations))
+print("Error violations:", length(error_violations))
+print("Warning violations:", length(warning_violations))
+
+for all_violations as v {
+  print("[" + v.severity + "] " + v.resource + ": " + v.message)
+}
+
+# Warnings are advisory — only fail on errors
+main = rule {
+  length(error_violations) is 0
+}

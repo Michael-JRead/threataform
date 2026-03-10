@@ -1,0 +1,162 @@
+# mandatory-resource-tag.sentinel
+# Layer 5 — Security Controls: Tagging enforcement policy
+# Requires enterprise-app-id and environment tags on all resources
+# Category: tagging — sentinel/global-policies
+
+import "tfplan/v2" as tfplan
+import "tfconfig/v2" as tfconfig
+import "strings"
+
+# ── Required tags ──────────────────────────────────────────────────────────────
+
+required_tags = [
+  "enterprise-app-id",
+  "environment",
+  "managed-by",
+  "cost-center",
+]
+
+allowed_environments = [
+  "production",
+  "staging",
+  "development",
+  "sandbox",
+  "management",
+]
+
+allowed_managed_by = [
+  "terraform",
+  "cloudformation",
+  "cdk",
+]
+
+# ── Resource type exceptions (global services that don't support tags) ─────────
+
+exempt_resource_types = [
+  "aws_iam_policy_attachment",
+  "aws_iam_role_policy",
+  "aws_iam_role_policy_attachment",
+  "aws_route_table_association",
+  "aws_subnet_route_table_association",
+  "aws_main_route_table_association",
+  "aws_security_group_rule",
+  "aws_network_acl_rule",
+  "aws_cloudwatch_log_resource_policy",
+  "aws_iam_openid_connect_provider",
+]
+
+# ── Helper functions ───────────────────────────────────────────────────────────
+
+get_resources_with_tags = func(plan) {
+  resources = {}
+  for plan.resource_changes as address, rc {
+    if rc.mode is "managed" and
+       rc.change.actions contains "create" or rc.change.actions contains "update" {
+      resources[address] = rc
+    }
+  }
+  return resources
+}
+
+is_exempt = func(resource_type) {
+  return resource_type in exempt_resource_types
+}
+
+check_required_tags = func(resource_address, resource_change) {
+  violations = []
+
+  # Skip exempt resource types
+  resource_type = strings.split(resource_address, ".")[0]
+  if is_exempt(resource_type) {
+    return violations
+  }
+
+  after_tags = resource_change.change.after.tags else {}
+  if after_tags is null {
+    after_tags = {}
+  }
+
+  # Check each required tag is present and non-empty
+  for required_tags as tag {
+    if tag not in after_tags or after_tags[tag] is "" or after_tags[tag] is null {
+      violations = append(violations, {
+        "resource": resource_address,
+        "missing_tag": tag,
+        "severity": "error",
+        "message": "Resource is missing required tag: " + tag,
+      })
+    }
+  }
+
+  # Validate environment value
+  if "environment" in after_tags {
+    env = after_tags["environment"]
+    if env not in allowed_environments {
+      violations = append(violations, {
+        "resource": resource_address,
+        "invalid_tag": "environment",
+        "value": env,
+        "allowed": allowed_environments,
+        "severity": "error",
+        "message": "Tag 'environment' has invalid value: " + env,
+      })
+    }
+  }
+
+  # Validate managed-by value
+  if "managed-by" in after_tags {
+    mb = after_tags["managed-by"]
+    if mb not in allowed_managed_by {
+      violations = append(violations, {
+        "resource": resource_address,
+        "invalid_tag": "managed-by",
+        "value": mb,
+        "severity": "warning",
+        "message": "Tag 'managed-by' has unexpected value: " + mb,
+      })
+    }
+  }
+
+  # Validate enterprise-app-id format (must be non-empty, reasonable length)
+  if "enterprise-app-id" in after_tags {
+    app_id = after_tags["enterprise-app-id"]
+    if length(app_id) < 3 or length(app_id) > 64 {
+      violations = append(violations, {
+        "resource": resource_address,
+        "invalid_tag": "enterprise-app-id",
+        "severity": "warning",
+        "message": "Tag 'enterprise-app-id' should be 3-64 characters long",
+      })
+    }
+  }
+
+  return violations
+}
+
+# ── Main evaluation ────────────────────────────────────────────────────────────
+
+all_resources = get_resources_with_tags(tfplan)
+
+all_violations = []
+for all_resources as address, resource_change {
+  violations = check_required_tags(address, resource_change)
+  all_violations = all_violations + violations
+}
+
+error_violations = filter all_violations as v { v.severity is "error" }
+
+print("=== Mandatory Resource Tag Policy ===")
+print("Total resources evaluated:", length(all_resources))
+print("Total violations found:", length(all_violations))
+print("Error-level violations:", length(error_violations))
+
+if length(error_violations) > 0 {
+  for error_violations as v {
+    print("VIOLATION [" + v.severity + "]: " + v.resource + " — " + v.message)
+  }
+}
+
+# main rule — policy fails if any error-level violations exist
+main = rule {
+  length(error_violations) is 0
+}

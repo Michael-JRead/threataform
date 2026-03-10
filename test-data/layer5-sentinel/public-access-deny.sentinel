@@ -1,0 +1,237 @@
+# public-access-deny.sentinel
+# Layer 5 — Security Controls: Prevent public exposure of private resources
+# Prevents public S3 buckets, public RDS, open security groups
+# Category: security — PCI DSS Req 1.2, GDPR Art. 25, SOX data controls
+
+import "tfplan/v2" as tfplan
+import "strings"
+
+# ── S3 Public Access Block enforcement ────────────────────────────────────────
+
+check_s3_public_access_block = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+
+  required_blocks = [
+    "block_public_acls",
+    "block_public_policy",
+    "ignore_public_acls",
+    "restrict_public_buckets",
+  ]
+
+  for required_blocks as block_name {
+    val = after[block_name] else null
+    if val is false or val is null {
+      violations = append(violations, {
+        "resource": address,
+        "issue":    block_name + " must be true",
+        "severity": "error",
+        "framework": "PCI-DSS-1.2/GDPR-Art25",
+      })
+    }
+  }
+
+  return violations
+}
+
+# ── Security Group open port checks ───────────────────────────────────────────
+
+dangerous_ports = {
+  22:    "SSH — no direct internet exposure allowed",
+  3389:  "RDP — no direct internet exposure allowed",
+  1433:  "MSSQL — database must not be internet-accessible",
+  3306:  "MySQL — database must not be internet-accessible",
+  5432:  "PostgreSQL — database must not be internet-accessible",
+  6379:  "Redis — cache must not be internet-accessible",
+  9200:  "Elasticsearch/OpenSearch — search must not be internet-accessible",
+  27017: "MongoDB — database must not be internet-accessible",
+  5601:  "Kibana — dashboard must not be internet-accessible",
+  2375:  "Docker daemon — must never be exposed to internet",
+  2376:  "Docker daemon TLS — must never be exposed to internet",
+  9092:  "Kafka — must not be internet-accessible",
+}
+
+internet_cidrs = ["0.0.0.0/0", "::/0"]
+
+is_internet_cidr = func(cidr) {
+  return cidr in internet_cidrs
+}
+
+check_security_group = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+
+  ingress_rules = after.ingress else []
+  if ingress_rules is null { ingress_rules = [] }
+
+  for ingress_rules as rule {
+    cidrs = rule.cidr_blocks else []
+    if cidrs is null { cidrs = [] }
+    ipv6_cidrs = rule.ipv6_cidr_blocks else []
+    if ipv6_cidrs is null { ipv6_cidrs = [] }
+
+    all_cidrs = cidrs + ipv6_cidrs
+
+    for all_cidrs as cidr {
+      if is_internet_cidr(cidr) {
+        from_port = rule.from_port else 0
+        to_port   = rule.to_port   else 65535
+
+        # Check if this rule exposes dangerous ports to internet
+        for dangerous_ports as port, reason {
+          if from_port <= port and to_port >= port {
+            violations = append(violations, {
+              "resource":  address,
+              "port":      port,
+              "cidr":      cidr,
+              "severity":  "error",
+              "framework": "PCI-DSS-1.2",
+              "message":   "Port " + string(port) + " exposed to internet: " + reason,
+            })
+          }
+        }
+
+        # Check for all-ports-open (protocol = -1 with internet CIDR)
+        if rule.protocol is "-1" or rule.protocol is "all" {
+          violations = append(violations, {
+            "resource":  address,
+            "cidr":      cidr,
+            "severity":  "error",
+            "framework": "PCI-DSS-1.2",
+            "message":   "All ports/protocols open to internet (0.0.0.0/0) — deny all ingress first",
+          })
+        }
+      }
+    }
+  }
+
+  return violations
+}
+
+# ── RDS Public Accessibility check ────────────────────────────────────────────
+
+check_rds_not_public = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  if after.publicly_accessible is true {
+    violations = append(violations, {
+      "resource":  address,
+      "severity":  "error",
+      "framework": "PCI-DSS/GDPR",
+      "message":   "RDS instance must not be publicly accessible: " + address,
+    })
+  }
+  return violations
+}
+
+# ── EKS Public Endpoint check ─────────────────────────────────────────────────
+
+check_eks_endpoint = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  vpc_config = after.vpc_config else []
+  if vpc_config is null { vpc_config = [] }
+
+  for vpc_config as vc {
+    if vc.endpoint_public_access is true and vc.endpoint_private_access is false {
+      violations = append(violations, {
+        "resource":  address,
+        "severity":  "error",
+        "framework": "CIS-EKS",
+        "message":   "EKS cluster endpoint must have private access enabled: " + address,
+      })
+    }
+  }
+  return violations
+}
+
+# ── Lambda Function URL public check ─────────────────────────────────────────
+
+check_lambda_function_url = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  auth_type = after.authorization_type else "NONE"
+  if auth_type is "NONE" {
+    cors = after.cors else []
+    if cors is null { cors = [] }
+    for cors as c {
+      origins = c.allow_origins else []
+      if "*" in origins {
+        violations = append(violations, {
+          "resource":  address,
+          "severity":  "error",
+          "framework": "PCI-DSS",
+          "message":   "Lambda Function URL has no auth and allows all CORS origins: " + address,
+        })
+      }
+    }
+  }
+  return violations
+}
+
+# ── ALB must not have HTTP-only listeners ─────────────────────────────────────
+
+check_alb_listener = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  if after.protocol is "HTTP" and after.port is not 80 {
+    violations = append(violations, {
+      "resource":  address,
+      "severity":  "warning",
+      "framework": "PCI-DSS-2.2.3/HIPAA-TLS",
+      "message":   "Non-redirect HTTP listener found — use HTTPS for all non-redirect endpoints: " + address,
+    })
+  }
+  return violations
+}
+
+# ── Main evaluation ────────────────────────────────────────────────────────────
+
+type_checkers = {
+  "aws_s3_bucket_public_access_block": check_s3_public_access_block,
+  "aws_security_group":               check_security_group,
+  "aws_db_instance":                  check_rds_not_public,
+  "aws_rds_cluster":                  check_rds_not_public,
+  "aws_eks_cluster":                  check_eks_endpoint,
+  "aws_lambda_function_url":          check_lambda_function_url,
+  "aws_lb_listener":                  check_alb_listener,
+}
+
+all_violations = []
+
+for tfplan.resource_changes as address, rc {
+  if rc.mode is "managed" and (rc.change.actions contains "create" or rc.change.actions contains "update") {
+    resource_type = strings.split(address, ".")[0]
+
+    if resource_type in type_checkers {
+      checker = type_checkers[resource_type]
+      violations = checker(address, rc)
+      all_violations = all_violations + violations
+    }
+  }
+}
+
+error_violations = filter all_violations as v { v.severity is "error" }
+
+print("=== Public Access Deny Policy ===")
+print("Total violations:", length(all_violations))
+print("Error violations:", length(error_violations))
+for error_violations as v {
+  print("VIOLATION: " + v.message)
+}
+
+main = rule {
+  length(error_violations) is 0
+}

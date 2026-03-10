@@ -6,6 +6,13 @@ import { KB } from '../../data/kb-domains.js';
 import { parseHCLBody, inferArchitectureHierarchy } from '../iac/TerraformParser.js';
 import { TF_MISCONFIG_CHECKS } from '../../data/misconfig-checks.js';
 
+// Yields execution back to the browser event loop.
+// Uses scheduler.yield() on Chrome 115+ (zero-delay), falls back to setTimeout(0).
+const yieldToMain = () =>
+  typeof scheduler !== 'undefined' && typeof scheduler.yield === 'function'
+    ? scheduler.yield()
+    : new Promise(r => setTimeout(r, 0));
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THREAT MODEL INTELLIGENCE ENGINE v2
 // BM25 (Robertson IDF, k1=1.5 b=0.75) + TF-IDF Cosine + RRF Fusion
@@ -176,7 +183,7 @@ class ThreatModelIntelligence {
     if (!text || text.trim().length < 20) return;
     const id = this.chunks.length;
     const trimmed = text.trim();
-    const entities = this._extractEntities(trimmed);
+    const entities = null; // lazy — computed on first access via _ents()
     const tokens = this._tokenize(trimmed);
     const tfMap = {};
     tokens.forEach(t => { tfMap[t] = (tfMap[t]||0)+1; this._vocab.add(t); });
@@ -185,19 +192,28 @@ class ThreatModelIntelligence {
     this._docLens.push(tokens.length);
   }
 
+  // ── Lazy entity accessor — extracts and caches on first access ───────────────
+  _ents(chunk) {
+    if (!chunk.entities) chunk.entities = this._extractEntities(chunk.text);
+    return chunk.entities;
+  }
+
   // ── Build BM25 IDF + TF-IDF vectors (call after all chunks added) ────────────
-  _buildIndex() {
+  async _buildIndex() {
     const N = this.chunks.length;
     if (N === 0) return;
     this._avgDocLen = this._docLens.reduce((a,b)=>a+b,0) / N;
-    // Robertson IDF: log((N − df + 0.5)/(df + 0.5) + 1)
+    // Step 1 — document frequency per term
     const df = {};
     this._tf.forEach(m => Object.keys(m).forEach(t => { df[t]=(df[t]||0)+1; }));
+    await yieldToMain(); // yield between Step 1 and Step 2
+    // Step 2 — Robertson IDF: log((N − df + 0.5)/(df + 0.5) + 1)
     this._idf = {};
     Object.entries(df).forEach(([t,dft]) => {
       this._idf[t] = Math.log((N - dft + 0.5)/(dft + 0.5) + 1);
     });
-    // TF-IDF vectors for cosine similarity
+    await yieldToMain(); // yield between Step 2 and Step 3
+    // Step 3 — TF-IDF vectors for cosine similarity
     this._tfidf = this._tf.map((m, i) => {
       const vec = {};
       const len = this._docLens[i] || 1;
@@ -280,8 +296,9 @@ class ThreatModelIntelligence {
     if (Object.values(qEnt).some(s=>Object.keys(s).length>0)) {
       this.chunks.forEach((c,i) => {
         let boost=0;
+        const ents = this._ents(c);
         Object.entries(qEnt).forEach(([cat,subs]) => {
-          Object.keys(subs).forEach(sub => { if(c.entities[cat]?.[sub]?.length) boost++; });
+          Object.keys(subs).forEach(sub => { if(ents[cat]?.[sub]?.length) boost++; });
         });
         if (boost>0) entBoost.push(i);
       });
@@ -788,7 +805,7 @@ class ThreatModelIntelligence {
           contradictions.push({type:'CONTRADICTION',title:'Docs describe private access but resource is publicly accessible',doc:chunk.source,excerpt:chunk.text.slice(0,160)});
         if(t.includes('mfa')&&r.type==='aws_iam_user')
           contradictions.push({type:'GAP',title:'Docs mention MFA but IAM user detected (prefer roles + SSO)',doc:chunk.source,excerpt:chunk.text.slice(0,160)});
-        const outOfScope=(chunk.entities?.scope?.outOfScope||[]);
+        const outOfScope=(this._ents(chunk)?.scope?.outOfScope||[]);
         if(outOfScope.some(s=>s.includes(r.type.replace('aws_',''))||s.includes(r.name)))
           contradictions.push({type:'SCOPE-VIOLATION',title:'Resource declared out-of-scope in architecture doc',doc:chunk.source,excerpt:chunk.text.slice(0,160)});
       });
@@ -824,7 +841,7 @@ class ThreatModelIntelligence {
   getArchitectureSummary(resources, userDocs) {
     const agg = {};
     this.chunks.forEach(c => {
-      Object.entries(c.entities).forEach(([cat,subs]) => {
+      Object.entries(this._ents(c)).forEach(([cat,subs]) => {
         Object.entries(subs).forEach(([sub,terms]) => {
           if (!agg[cat]) agg[cat]={};
           if (!agg[cat][sub]) agg[cat][sub]=new Set();
@@ -839,11 +856,11 @@ class ThreatModelIntelligence {
     });
     const rtCounts={};
     (resources||[]).forEach(r=>{ rtCounts[r.type]=(rtCounts[r.type]||0)+1; });
-    const scopeChunks=this.chunks.filter(c=>c.entities.scope?.inScope?.length||c.entities.scope?.outOfScope?.length).map(c=>({
-      source:c.source, inScope:c.entities.scope?.inScope||[], outOfScope:c.entities.scope?.outOfScope||[], excerpt:c.text.substring(0,200)+(c.text.length>200?'...':''),
+    const scopeChunks=this.chunks.filter(c=>this._ents(c).scope?.inScope?.length||this._ents(c).scope?.outOfScope?.length).map(c=>({
+      source:c.source, inScope:this._ents(c).scope?.inScope||[], outOfScope:this._ents(c).scope?.outOfScope||[], excerpt:c.text.substring(0,200)+(c.text.length>200?'...':''),
     }));
-    const threatChunks=this.chunks.filter(c=>Object.keys(c.entities.stride||{}).length>0).map(c=>({
-      source:c.source, category:c.category, threats:Object.keys(c.entities.stride||{}), excerpt:c.text.substring(0,200)+(c.text.length>200?'...':''),
+    const threatChunks=this.chunks.filter(c=>Object.keys(this._ents(c).stride||{}).length>0).map(c=>({
+      source:c.source, category:c.category, threats:Object.keys(this._ents(c).stride||{}), excerpt:c.text.substring(0,200)+(c.text.length>200?'...':''),
     }));
     // ATT&CK coverage across terraform resources
     const allTechniques=new Set();
@@ -1145,14 +1162,16 @@ class ThreatModelIntelligence {
   }
 
   // ── Index user-uploaded documents ────────────────────────────────────────────
-  indexDocuments(userDocs) {
-    (userDocs||[]).forEach((doc,di) => {
-      if (doc.binary||!doc.content||doc.content.length<10) return;
+  async indexDocuments(userDocs) {
+    for (let di = 0; di < (userDocs||[]).length; di++) {
+      const doc = userDocs[di];
+      if (doc.binary||!doc.content||doc.content.length<10) continue;
       const cat = this._categorizeDoc(doc);
       this._splitText(doc.content).forEach((chunk,ci) => {
         this._addChunk(doc.name||doc.path, chunk, cat, `doc_${di}`, ci);
       });
-    });
+      if (di % 20 === 19) await yieldToMain(); // yield every 20 docs
+    }
   }
 
   // ── Index parsed Terraform resources ────────────────────────────────────────
@@ -1284,19 +1303,21 @@ class ThreatModelIntelligence {
   }
 
   // ── Full rebuild ─────────────────────────────────────────────────────────────
-  build(userDocs, resources, modules, archAnalysis = null) {
+  async build(userDocs, resources, modules, archAnalysis = null) {
     this.chunks=[]; this._tf=[]; this._tfidf=[]; this._docLens=[];
     this._idf={}; this._vocab=new Set(); this._built=false;
-    this.indexDocuments(userDocs);
-    this.indexResources(resources, modules);
-    this._buildIndex();
+    await this.indexDocuments(userDocs);
+    this.indexResources(resources, modules); // fast (~107 simple text chunks), stays sync
+    await yieldToMain();
+    await this._buildIndex();
     this._built=true;
     if (archAnalysis && archAnalysis.layers) {
       const archDoc = this._synthesizeArchDoc(archAnalysis);
       if (archDoc) {
         const synChunks = this._chunkText(archDoc, 'arch-layer-analysis', 'arch-analysis');
         synChunks.forEach(c => { this.chunks.push(c); });
-        this._buildIndex(); // rebuild index with arch doc included
+        await yieldToMain();
+        await this._buildIndex(); // rebuild index with arch doc included
       }
     }
     return this;
@@ -1307,7 +1328,7 @@ class ThreatModelIntelligence {
     return this._splitText(text).map((chunk, ci) => {
       const id = this.chunks.length + ci;
       const trimmed = chunk.trim();
-      const entities = this._extractEntities(trimmed);
+      const entities = null; // lazy — computed on first access via _ents()
       const tokens = this._tokenize(trimmed);
       const tfMap = {};
       tokens.forEach(t => { tfMap[t] = (tfMap[t]||0)+1; this._vocab.add(t); });
@@ -1389,7 +1410,7 @@ class ThreatModelIntelligence {
   }
 
   // ── Incremental: add a single doc without full rebuild ───────────────────────
-  addDoc(doc) {
+  async addDoc(doc) {
     if (!doc || doc.binary || !doc.content || doc.content.length < 10) return;
     const source = doc.name || doc.path;
     // Skip if doc already indexed (same source already has chunks)
@@ -1399,12 +1420,12 @@ class ThreatModelIntelligence {
     this._splitText(doc.content).forEach((chunk, ci) => {
       this._addChunk(source, chunk, cat, docId, ci);
     });
-    this._buildIndex();
+    await this._buildIndex();
     this._built = true;
   }
 
   // ── Incremental: remove a single doc by source name or path ─────────────────
-  removeDoc(pathOrName) {
+  async removeDoc(pathOrName) {
     // Match by exact source OR by bare filename (strip directory prefix)
     const bare = pathOrName.replace(/^.*[\\/]/, '');
     const keep = this.chunks.map((c, i) => c.source !== pathOrName && c.source !== bare ? i : -1).filter(i => i >= 0);
@@ -1414,7 +1435,7 @@ class ThreatModelIntelligence {
     this._docLens = keep.map(i => this._docLens[i]);
     // Reassign sequential IDs
     this.chunks.forEach((c, i) => { c.id = i; });
-    this._buildIndex();
+    await this._buildIndex();
   }
 
   // ── Legacy: keep _addChunk's old index object intact for any callers ─────────

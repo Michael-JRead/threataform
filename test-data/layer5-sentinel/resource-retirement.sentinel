@@ -1,0 +1,203 @@
+# resource-retirement.sentinel
+# Layer 5 — Security Controls: Resource retirement enforcement
+# Prevents usage of deprecated/retired resource types
+# Category: lifecycle — platform governance
+
+import "tfplan/v2" as tfplan
+import "tfconfig/v2" as tfconfig
+import "strings"
+
+# ── Deprecated resource types ─────────────────────────────────────────────────
+
+retired_resource_types = {
+  # EC2 generation retirement
+  "aws_instance_t1":                   "T1 instances retired — use T3 or later",
+  "aws_instance_m1":                   "M1 instances retired — use M5/M6i",
+  "aws_instance_m2":                   "M2 instances retired — use R5/R6i for memory-optimized",
+  "aws_instance_c1":                   "C1 instances retired — use C5/C6i",
+
+  # RDS deprecations
+  "aws_rds_cluster_instance_db_t1":    "db.t1 RDS class retired — use db.t3 or higher",
+  "aws_rds_cluster_instance_db_m1":    "db.m1 RDS class retired — use db.m5 or higher",
+
+  # Old Elasticsearch (replaced by OpenSearch)
+  "aws_elasticsearch_domain":          "aws_elasticsearch_domain deprecated — migrate to aws_opensearch_domain",
+
+  # Classic Load Balancer
+  "aws_elb":                           "Classic ELB (aws_elb) retired — use aws_lb (ALB/NLB)",
+  "aws_lb_cookie_stickiness_policy":   "Classic LB stickiness retired — use ALB with aws_lb_listener_rule",
+  "aws_proxy_protocol_policy":         "Classic LB proxy protocol retired — use NLB with aws_lb",
+  "aws_app_cookie_stickiness_policy":  "Classic LB app cookie retired — use ALB target group stickiness",
+
+  # CloudWatch Logs v1 subscriptions
+  "aws_cloudwatch_log_subscription_filter_v1": "Use aws_cloudwatch_log_subscription_filter (v2 API)",
+
+  # CodeCommit (AWS deprecated)
+  "aws_codecommit_repository":         "CodeCommit deprecated — migrate to GitHub or CodeCatalyst",
+  "aws_codecommit_trigger":            "CodeCommit deprecated — migrate to GitHub Actions",
+
+  # OpsWorks (deprecated)
+  "aws_opsworks_stack":                "OpsWorks deprecated — migrate to ECS/EKS",
+  "aws_opsworks_application":          "OpsWorks deprecated",
+  "aws_opsworks_instance":             "OpsWorks deprecated",
+  "aws_opsworks_layer":                "OpsWorks deprecated",
+
+  # DynamoDB v1 table streams
+  "aws_dynamodb_table_item_v1":        "Use aws_dynamodb_table_item from recent provider",
+
+  # Old KMS grant API
+  "aws_kms_grant_v1":                  "Use current aws_kms_grant resource",
+
+  # EC2 Classic (no VPC)
+  "aws_eip_association_classic":       "EC2-Classic retired — all resources must use VPC",
+  "aws_security_group_classic":        "EC2-Classic security groups retired",
+
+  # Redshift classic (no VPC)
+  "aws_redshift_security_group":       "Redshift classic security group retired — use VPC security groups",
+  "aws_redshift_subnet_group_classic": "Use aws_redshift_subnet_group in VPC",
+
+  # Old ECS task scheduler
+  "aws_ecs_task_definition_v1":        "Use current aws_ecs_task_definition resource",
+}
+
+# ── Deprecated AMI patterns (by region+date) ──────────────────────────────────
+
+deprecated_amis = {
+  "ami-00000000": "Deprecated base AMI — use enterprise golden AMI from SSM Parameter Store",
+  "ami-0000dead": "Security-patched AMI — use current baseline AMI",
+}
+
+# ── Banned Terraform provider versions ────────────────────────────────────────
+
+min_provider_versions = {
+  "aws":        "4.0.0",
+  "kubernetes": "2.0.0",
+  "helm":       "2.0.0",
+  "random":     "3.0.0",
+  "null":       "3.0.0",
+  "archive":    "2.0.0",
+}
+
+# ── Banned instance types (end of support) ────────────────────────────────────
+
+banned_instance_types = [
+  # Generation 1-2 banned
+  "t1.micro",
+  "m1.small", "m1.medium", "m1.large", "m1.xlarge",
+  "m2.xlarge", "m2.2xlarge", "m2.4xlarge",
+  "c1.medium", "c1.xlarge",
+  # Deprecated RDS classes
+  "db.t1.micro",
+  "db.m1.small", "db.m1.medium", "db.m1.large",
+  "db.m2.xlarge", "db.m2.2xlarge",
+]
+
+# ── Checks ────────────────────────────────────────────────────────────────────
+
+check_retired_resource_types = func() {
+  violations = []
+
+  for tfplan.resource_changes as address, rc {
+    if rc.mode is "managed" {
+      resource_type = strings.split(address, ".")[0]
+      if resource_type in retired_resource_types {
+        violations = append(violations, {
+          "resource": address,
+          "type":     resource_type,
+          "severity": "error",
+          "message":  "Retired resource type: " + retired_resource_types[resource_type],
+        })
+      }
+    }
+  }
+
+  return violations
+}
+
+check_deprecated_elasticsearch = func() {
+  violations = []
+
+  for tfplan.resource_changes as address, rc {
+    if rc.mode is "managed" {
+      resource_type = strings.split(address, ".")[0]
+      if resource_type is "aws_elasticsearch_domain" {
+        violations = append(violations, {
+          "resource": address,
+          "severity": "error",
+          "message":  "aws_elasticsearch_domain is deprecated — migrate to aws_opensearch_domain (provider >= 4.0)",
+        })
+      }
+    }
+  }
+
+  return violations
+}
+
+check_banned_instance_types = func() {
+  violations = []
+
+  for tfplan.resource_changes as address, rc {
+    if rc.mode is "managed" and (rc.change.actions contains "create" or rc.change.actions contains "update") {
+      after = rc.change.after
+      if after is null { continue }
+
+      instance_type = after.instance_type else after.instance_class else null
+      if instance_type is null { continue }
+
+      if instance_type in banned_instance_types {
+        violations = append(violations, {
+          "resource":      address,
+          "instance_type": instance_type,
+          "severity":      "error",
+          "message":       "Instance type " + instance_type + " is end-of-life and banned — use current generation",
+        })
+      }
+    }
+  }
+
+  return violations
+}
+
+check_classic_elb = func() {
+  violations = []
+
+  for tfplan.resource_changes as address, rc {
+    if rc.mode is "managed" {
+      resource_type = strings.split(address, ".")[0]
+      if resource_type is "aws_elb" {
+        violations = append(violations, {
+          "resource": address,
+          "severity": "error",
+          "message":  "Classic ELB (aws_elb) retired — migrate to Application Load Balancer (aws_lb)",
+        })
+      }
+    }
+  }
+
+  return violations
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+type_violations     = check_retired_resource_types()
+es_violations       = check_deprecated_elasticsearch()
+instance_violations = check_banned_instance_types()
+elb_violations      = check_classic_elb()
+
+all_violations = type_violations + es_violations + instance_violations + elb_violations
+error_violations = filter all_violations as v { v.severity is "error" }
+
+print("=== Resource Retirement Policy ===")
+print("Retired type violations:", length(type_violations))
+print("Deprecated Elasticsearch:", length(es_violations))
+print("Banned instance types:", length(instance_violations))
+print("Classic ELB violations:", length(elb_violations))
+print("Total error violations:", length(error_violations))
+
+for error_violations as v {
+  print("[ERROR] " + v.resource + ": " + v.message)
+}
+
+main = rule {
+  length(error_violations) is 0
+}

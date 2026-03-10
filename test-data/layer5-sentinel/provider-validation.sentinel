@@ -1,0 +1,183 @@
+# provider-validation.sentinel
+# Layer 5 — Security Controls: Provider configuration validation
+# Ensures AWS provider has required region and default tags
+# Category: governance — Terraform Enterprise policy enforcement
+
+import "tfconfig/v2" as tfconfig
+import "tfplan/v2" as tfplan
+import "strings"
+
+# ── Allowed regions (from GDPR data residency SCP) ────────────────────────────
+
+allowed_regions = [
+  "us-east-1",
+  "us-west-2",
+  "eu-west-1",
+  "eu-central-1",
+  "ap-southeast-1",
+  "ap-northeast-1",
+]
+
+# ── Required default tags in AWS provider ─────────────────────────────────────
+
+required_default_tags = [
+  "managed-by",
+  "enterprise-app-id",
+  "environment",
+]
+
+# ── Required backend type ─────────────────────────────────────────────────────
+
+# All workloads must use S3 remote state backend (not local)
+# Enforced separately via Terraform Enterprise workspace settings
+# This policy validates provider configuration only
+
+# ── Provider checks ────────────────────────────────────────────────────────────
+
+check_provider_region = func() {
+  violations = []
+
+  for tfconfig.providers as provider_addr, provider_config {
+    # Only check AWS provider
+    if not strings.has_prefix(provider_addr, "aws") {
+      continue
+    }
+
+    config = provider_config.config else {}
+    region = config.region else {}
+
+    region_value = null
+
+    if "constant_value" in region {
+      region_value = region.constant_value
+    } else if "references" in region {
+      # Dynamic region via variable — cannot validate at plan time
+      # Generate warning only
+      violations = append(violations, {
+        "provider": provider_addr,
+        "severity": "warning",
+        "message":  "AWS provider region is set via variable — ensure it resolves to an approved region",
+      })
+      continue
+    }
+
+    if region_value is not null and region_value not in allowed_regions {
+      violations = append(violations, {
+        "provider": provider_addr,
+        "region":   region_value,
+        "severity": "error",
+        "message":  "AWS provider region " + region_value + " is not in the approved list: " + strings.join(allowed_regions, ", "),
+      })
+    }
+  }
+
+  return violations
+}
+
+check_provider_default_tags = func() {
+  violations = []
+
+  for tfconfig.providers as provider_addr, provider_config {
+    if not strings.has_prefix(provider_addr, "aws") {
+      continue
+    }
+
+    config = provider_config.config else {}
+    default_tags = config.default_tags else []
+
+    if length(default_tags) is 0 {
+      violations = append(violations, {
+        "provider": provider_addr,
+        "severity": "warning",
+        "message":  "AWS provider missing default_tags block — enterprise tagging policy requires default tags",
+      })
+      continue
+    }
+
+    for default_tags as tag_block {
+      tags = tag_block.tags else {}
+      if "constant_value" in tags {
+        tag_map = tags.constant_value else {}
+        for required_default_tags as required_tag {
+          if required_tag not in tag_map {
+            violations = append(violations, {
+              "provider":    provider_addr,
+              "missing_tag": required_tag,
+              "severity":    "warning",
+              "message":     "AWS provider default_tags missing required tag: " + required_tag,
+            })
+          }
+        }
+      }
+    }
+  }
+
+  return violations
+}
+
+# ── Check no local backend used ───────────────────────────────────────────────
+
+check_remote_backend = func() {
+  violations = []
+
+  backend = tfconfig.terraform.backend else null
+  if backend is null {
+    violations = append(violations, {
+      "severity": "error",
+      "message":  "No backend configured — all workloads must use S3 remote backend for state locking (SOX-03)",
+    })
+    return violations
+  }
+
+  if backend.type is "local" {
+    violations = append(violations, {
+      "severity": "error",
+      "message":  "Local backend is not allowed — use S3+DynamoDB remote backend for state locking (SOX-03)",
+    })
+  }
+
+  if backend.type is "s3" {
+    s3_config = backend.config else {}
+    # Verify encryption is enabled
+    encrypt = s3_config.encrypt else {}
+    if "constant_value" in encrypt and encrypt.constant_value is false {
+      violations = append(violations, {
+        "severity": "error",
+        "message":  "S3 backend must have encrypt = true for state file protection",
+      })
+    }
+    # Verify DynamoDB lock table is configured
+    dynamodb_table = s3_config.dynamodb_table else {}
+    if length(dynamodb_table) is 0 {
+      violations = append(violations, {
+        "severity": "error",
+        "message":  "S3 backend must configure dynamodb_table for state locking (SOX-03)",
+      })
+    }
+  }
+
+  return violations
+}
+
+# ── Main evaluation ────────────────────────────────────────────────────────────
+
+region_violations      = check_provider_region()
+default_tag_violations = check_provider_default_tags()
+backend_violations     = check_remote_backend()
+
+all_violations = region_violations + default_tag_violations + backend_violations
+error_violations = filter all_violations as v { v.severity is "error" }
+
+print("=== Provider Validation Policy ===")
+print("Region violations:", length(region_violations))
+print("Default tag violations:", length(default_tag_violations))
+print("Backend violations:", length(backend_violations))
+print("Total error violations:", length(error_violations))
+
+for error_violations as v {
+  print("[ERROR] " + v.message)
+}
+
+main = rule {
+  length(error_violations) is 0
+}

@@ -1,0 +1,259 @@
+# cost-control.sentinel
+# Layer 5 — Security Controls: Cost control enforcement
+# Enforces instance type allowlists and storage size limits
+# Category: lifecycle — SOX financial controls, FinOps governance
+
+import "tfplan/v2" as tfplan
+import "strings"
+
+# ── Allowed instance types by tier ────────────────────────────────────────────
+
+allowed_ec2_types = {
+  "production": [
+    "t3.medium", "t3.large", "t3.xlarge",
+    "m5.large", "m5.xlarge", "m5.2xlarge", "m5.4xlarge",
+    "m6i.large", "m6i.xlarge", "m6i.2xlarge", "m6i.4xlarge",
+    "c5.large", "c5.xlarge", "c5.2xlarge", "c5.4xlarge",
+    "c6i.large", "c6i.xlarge", "c6i.2xlarge",
+    "r5.large", "r5.xlarge", "r5.2xlarge",
+    "r6i.large", "r6i.xlarge",
+  ],
+  "staging": [
+    "t3.small", "t3.medium", "t3.large",
+    "m5.large", "m5.xlarge",
+    "m6i.large", "m6i.xlarge",
+  ],
+  "development": [
+    "t3.micro", "t3.small", "t3.medium",
+    "t3a.micro", "t3a.small", "t3a.medium",
+  ],
+  "sandbox": [
+    "t3.micro", "t3.small", "t3.medium",
+    "t2.micro", "t2.small",
+  ],
+  "management": [
+    "t3.small", "t3.medium", "t3.large",
+    "m5.large", "m5.xlarge",
+  ],
+}
+
+# GPU instances are banned (require explicit approval)
+banned_ec2_prefixes = ["p2.", "p3.", "p4.", "g3.", "g4.", "g5.", "f1.", "inf"]
+
+# ── Allowed RDS instance types ─────────────────────────────────────────────────
+
+allowed_rds_types = {
+  "production": [
+    "db.t3.medium", "db.t3.large",
+    "db.m5.large", "db.m5.xlarge", "db.m5.2xlarge",
+    "db.m6i.large", "db.m6i.xlarge", "db.m6i.2xlarge",
+    "db.r5.large", "db.r5.xlarge", "db.r5.2xlarge",
+    "db.r6i.large", "db.r6i.xlarge",
+    "db.r6g.large", "db.r6g.xlarge",
+  ],
+  "staging": [
+    "db.t3.small", "db.t3.medium",
+    "db.m5.large",
+  ],
+  "development": [
+    "db.t3.micro", "db.t3.small", "db.t3.medium",
+  ],
+  "sandbox": [
+    "db.t3.micro", "db.t3.small",
+  ],
+  "management": [
+    "db.t3.medium", "db.m5.large",
+  ],
+}
+
+# ── Storage limits (GB) ───────────────────────────────────────────────────────
+
+max_rds_storage_gb = {
+  "production": 10000,
+  "staging":    2000,
+  "development": 500,
+  "sandbox":    100,
+  "management": 1000,
+}
+
+max_ebs_size_gb = {
+  "production": 16000,
+  "staging":    4000,
+  "development": 1000,
+  "sandbox":    200,
+  "management": 2000,
+}
+
+# ── EKS node group instance type checks ───────────────────────────────────────
+
+allowed_eks_node_types = {
+  "production": [
+    "m5.large", "m5.xlarge", "m5.2xlarge",
+    "m6i.large", "m6i.xlarge",
+    "c5.xlarge", "c5.2xlarge",
+    "r5.large", "r5.xlarge",
+  ],
+  "staging": ["m5.large", "m5.xlarge", "m6i.large"],
+  "development": ["t3.medium", "t3.large", "m5.large"],
+}
+
+# ── ElastiCache node type checks ──────────────────────────────────────────────
+
+allowed_cache_types = {
+  "production": [
+    "cache.t3.medium", "cache.m5.large", "cache.m5.xlarge",
+    "cache.r5.large", "cache.r5.xlarge",
+  ],
+  "staging":     ["cache.t3.small", "cache.t3.medium"],
+  "development": ["cache.t3.micro", "cache.t3.small"],
+  "sandbox":     ["cache.t3.micro"],
+}
+
+# ── Helper: get environment from tags ─────────────────────────────────────────
+
+get_env = func(rc) {
+  after = rc.change.after
+  if after is null { return "development" }
+  tags = after.tags else {}
+  if tags is null { return "development" }
+  env = tags["environment"] else "development"
+  if env is null { return "development" }
+  return env
+}
+
+# ── Checks ────────────────────────────────────────────────────────────────────
+
+check_ec2_instance_type = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  instance_type = after.instance_type else null
+  if instance_type is null { return violations }
+
+  env = get_env(rc)
+  allowed = allowed_ec2_types[env] else allowed_ec2_types["development"]
+
+  # Check banned GPU prefixes
+  for banned_ec2_prefixes as prefix {
+    if strings.has_prefix(instance_type, prefix) {
+      violations = append(violations, {
+        "resource":      address,
+        "instance_type": instance_type,
+        "severity":      "error",
+        "message":       "GPU/specialized instance type requires explicit approval: " + instance_type,
+      })
+    }
+  }
+
+  if instance_type not in allowed {
+    violations = append(violations, {
+      "resource":      address,
+      "instance_type": instance_type,
+      "env":           env,
+      "allowed":       allowed,
+      "severity":      "error",
+      "message":       "EC2 instance type " + instance_type + " not allowed in " + env + " environment",
+    })
+  }
+
+  return violations
+}
+
+check_rds_instance_type = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  instance_class = after.instance_class else null
+  if instance_class is null { return violations }
+
+  env = get_env(rc)
+  allowed = allowed_rds_types[env] else allowed_rds_types["development"]
+
+  if instance_class not in allowed {
+    violations = append(violations, {
+      "resource":       address,
+      "instance_class": instance_class,
+      "env":            env,
+      "severity":       "error",
+      "message":        "RDS instance class " + instance_class + " not in allowlist for " + env,
+    })
+  }
+
+  # Check storage size
+  storage = after.allocated_storage else 0
+  if storage is null { storage = 0 }
+  max_storage = max_rds_storage_gb[env] else 100
+  if storage > max_storage {
+    violations = append(violations, {
+      "resource": address,
+      "storage":  storage,
+      "max":      max_storage,
+      "env":      env,
+      "severity": "error",
+      "message":  "RDS allocated_storage " + string(storage) + "GB exceeds limit " + string(max_storage) + "GB for " + env,
+    })
+  }
+
+  return violations
+}
+
+check_cache_node_type = func(address, rc) {
+  after = rc.change.after
+  if after is null { return [] }
+
+  violations = []
+  node_type = after.node_type else null
+  if node_type is null { return violations }
+
+  env = get_env(rc)
+  allowed = allowed_cache_types[env] else allowed_cache_types["development"]
+
+  if node_type not in allowed {
+    violations = append(violations, {
+      "resource":  address,
+      "node_type": node_type,
+      "env":       env,
+      "severity":  "error",
+      "message":   "ElastiCache node type " + node_type + " not in allowlist for " + env,
+    })
+  }
+
+  return violations
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+type_checkers = {
+  "aws_instance":                      check_ec2_instance_type,
+  "aws_launch_template":               check_ec2_instance_type,
+  "aws_db_instance":                   check_rds_instance_type,
+  "aws_elasticache_cluster":           check_cache_node_type,
+  "aws_elasticache_replication_group": check_cache_node_type,
+}
+
+all_violations = []
+
+for tfplan.resource_changes as address, rc {
+  if rc.mode is "managed" and (rc.change.actions contains "create" or rc.change.actions contains "update") {
+    resource_type = strings.split(address, ".")[0]
+    if resource_type in type_checkers {
+      violations = type_checkers[resource_type](address, rc)
+      all_violations = all_violations + violations
+    }
+  }
+}
+
+error_violations = filter all_violations as v { v.severity is "error" }
+
+print("=== Cost Control Policy ===")
+print("Total cost violations:", length(all_violations))
+print("Error violations:", length(error_violations))
+for error_violations as v {
+  print("[" + v.severity + "] " + v.resource + ": " + v.message)
+}
+
+main = rule {
+  length(error_violations) is 0
+}

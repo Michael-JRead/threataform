@@ -73,6 +73,11 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
   const [kfGenerating, setKfGenerating] = useState(false);
   const kfRef = useRef(null);
 
+  // ── TF / IaC file state ──────────────────────────────────────────────────────
+  const [tfReadFiles, setTfReadFiles] = useState([]); // {path, name, content, size} read as text
+  const [tfProgress,  setTfProgress]  = useState(null); // null | {done,total,current}
+  const [tfDragging,  setTfDragging]  = useState(false);
+
   // Auto-resize key features textarea
   useEffect(() => {
     if (kfRef.current) {
@@ -136,6 +141,65 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
       if (onPickDirectory) onPickDirectory(dirHandle);
     } catch (err) {
       if (err?.name !== 'AbortError') console.warn('[DocumentsPage] showDirectoryPicker failed:', err);
+    }
+  };
+
+  // ── Read TF/HCL files as text in batches of 8 ───────────────────────────────
+  const readTFFiles = async (fileList) => {
+    const TF_EXT   = /\.(tf|hcl|sentinel|tfvars)$/i;
+    const CFN_JSON = /\.cfn\.json$/i;
+    const SKIP     = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc|lock)$/i;
+    const candidates = Array.from(fileList).filter(f =>
+      (TF_EXT.test(f.name) || CFN_JSON.test(f.name)) && !SKIP.test(f.name) && f.size < 512 * 1024 * 1024
+    );
+    if (!candidates.length) return;
+    const BATCH = 8;
+    let done = 0;
+    const total = candidates.length;
+    setTfProgress({ done: 0, total, current: candidates[0]?.name || "" });
+    const results = [];
+    for (let i = 0; i < candidates.length; i += BATCH) {
+      const batch = candidates.slice(i, i + BATCH);
+      const batchResults = await Promise.all(batch.map(f => new Promise(res => {
+        setTfProgress(p => ({ ...p, current: f.name }));
+        const r = new FileReader();
+        r.onload  = ev => res({ path: f.webkitRelativePath || f.name, name: f.name, content: ev.target.result || "", size: f.size });
+        r.onerror = ()  => res(null);
+        r.readAsText(f);
+      })));
+      results.push(...batchResults.filter(Boolean));
+      done += batch.length;
+      setTfProgress({ done, total, current: candidates[i + BATCH]?.name || "" });
+    }
+    setTfReadFiles(prev => {
+      const existPaths = new Set(prev.map(f => f.path));
+      const newFiles = results.filter(f => !existPaths.has(f.path));
+      return [...prev, ...newFiles];
+    });
+    setTfProgress(null);
+  };
+
+  // ── FSAPI picker for TF folder (Chrome/Edge only) ───────────────────────────
+  const handleTFDirectoryPicker = async () => {
+    try {
+      const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+      const TF_EXT = /\.(tf|hcl|sentinel|tfvars)$/i;
+      const collected = [];
+      const traverse = async (handle) => {
+        for await (const [name, entry] of handle.entries()) {
+          if (name.startsWith('.')) continue;
+          if (entry.kind === 'file') {
+            const file = await entry.getFile();
+            if (TF_EXT.test(name)) collected.push(file);
+          } else if (entry.kind === 'directory') {
+            await traverse(entry);
+          }
+        }
+      };
+      await traverse(dirHandle);
+      if (collected.length) readTFFiles(collected);
+    } catch (err) {
+      if (err?.name !== 'AbortError') console.warn('[DocumentsPage] TF dir picker failed:', err);
     }
   };
 
@@ -365,15 +429,21 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
         )}
 
         {/* Continue */}
-        <button onClick={onContinue} style={{
-          display:"flex", alignItems:"center", gap:7, background:`linear-gradient(135deg,${C.accent},${C.accent}cc)`,
-          border:"none", borderRadius:8, padding:"8px 18px", color:"#fff",
-          fontSize:13, fontWeight:700, cursor:"pointer", ...SANS,
-        }}>
+        <button
+          onClick={() => onContinue(tfReadFiles)}
+          disabled={tfProgress !== null}
+          style={{
+            display:"flex", alignItems:"center", gap:7, background:`linear-gradient(135deg,${C.accent},${C.accent}cc)`,
+            border:"none", borderRadius:8, padding:"8px 18px", color:"#fff",
+            fontSize:13, fontWeight:700, ...SANS,
+            cursor: tfProgress ? "not-allowed" : "pointer",
+            opacity: tfProgress ? 0.65 : 1,
+          }}
+        >
           Continue <ArrowRight size={14}/>
-          {totalDocs > 0 && (
+          {(totalDocs > 0 || tfReadFiles.length > 0) && (
             <span style={{ background:"rgba(255,255,255,.2)", borderRadius:10, padding:"1px 7px", fontSize:11 }}>
-              {totalDocs}
+              {tfReadFiles.length + totalDocs}
             </span>
           )}
         </button>
@@ -412,26 +482,31 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
             Sections
           </div>
           {[
+            { id:"tf-files",  label:"Terraform / IaC",      items:[], tfCount: true },
             { id:"group-a",   label:"Enterprise Context",   items:["enterprise-arch","app-details"] },
             { id:"key-feat",  label:"Key Features",         items:[] },
             { id:"group-b",   label:"Security & Compliance",items:["security-controls","cspm","compliance-guide","trust-cloud"] },
             { id:"frameworks",label:"Analysis Frameworks",  items:[] },
           ].map(section => {
-            const count = section.items.reduce((s,id) => s + (docsByCategory[id]?.length||0), 0);
+            const count = section.tfCount
+              ? tfReadFiles.length
+              : section.items.reduce((s,id) => s + (docsByCategory[id]?.length||0), 0);
             const hasExtra = section.id === "frameworks"
               ? ((modelDetails.frameworks?.length||0) + (modelDetails.threatFrameworks?.length||0)) > 0
               : false;
+            const tfAccentColor = "#7C4DFF";
+            const activeColor = section.tfCount ? tfAccentColor : C.accent;
             return (
               <a key={section.id} href={`#${section.id}`} style={{
                 display:"flex", alignItems:"center", justifyContent:"space-between",
                 padding:"8px 10px", borderRadius:6, marginBottom:2,
-                color: count || hasExtra ? C.accent : C.textSub, fontSize:12, textDecoration:"none", ...SANS,
-                background: count || hasExtra ? `${C.accent}10` : "transparent",
+                color: count || hasExtra ? activeColor : C.textSub, fontSize:12, textDecoration:"none", ...SANS,
+                background: count || hasExtra ? `${activeColor}10` : "transparent",
               }}>
                 <span style={{fontWeight: count || hasExtra ? 600 : 400}}>{section.label}</span>
                 {(count > 0) && (
-                  <span style={{ fontSize:10, fontWeight:700, background:`${C.accent}22`, color:C.accent,
-                    border:`1px solid ${C.accent}44`, borderRadius:9, padding:"1px 6px" }}>
+                  <span style={{ fontSize:10, fontWeight:700, background:`${activeColor}22`, color:activeColor,
+                    border:`1px solid ${activeColor}44`, borderRadius:9, padding:"1px 6px" }}>
                     {count}
                   </span>
                 )}
@@ -442,7 +517,8 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
           <div style={{ marginTop:20, paddingTop:16, borderTop:`1px solid ${C.border}` }}>
             <div style={{fontSize:10, color:C.textMuted, fontWeight:600, textTransform:"uppercase", letterSpacing:".12em", marginBottom:8, paddingLeft:4}}>Summary</div>
             <div style={{fontSize:12, color:C.textSub, padding:"0 4px", ...SANS}}>
-              <div style={{marginBottom:4}}><span style={{fontWeight:700, color:C.accent}}>{totalDocs}</span> docs uploaded</div>
+              <div style={{marginBottom:4}}><span style={{fontWeight:700, color:"#7C4DFF"}}>{tfReadFiles.length}</span> TF/IaC files</div>
+              <div style={{marginBottom:4}}><span style={{fontWeight:700, color:C.accent}}>{totalDocs}</span> supporting docs</div>
               <div style={{marginBottom:4}}><span style={{fontWeight:700, color:"#7B1FA2"}}>{modelDetails.frameworks?.length||0}</span> industry frameworks</div>
               <div><span style={{fontWeight:700, color:"#E65100"}}>{modelDetails.threatFrameworks?.length||0}</span> threat frameworks</div>
             </div>
@@ -451,6 +527,139 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
 
         {/* ── Main Content ── */}
         <div style={{ flex:1, overflowY:"auto", padding:"28px 32px", maxWidth:860 }}>
+
+          {/* ── TERRAFORM / IaC SECTION ── */}
+          <div id="tf-files" style={{ marginBottom:32 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+              <div style={{ fontSize:20, lineHeight:1 }}>🏗</div>
+              <div>
+                <div style={{...SANS, fontSize:15, fontWeight:700, color:C.text}}>Terraform / IaC Repository</div>
+                <div style={{fontSize:12, color:C.textMuted}}>Upload your entire Terraform/HCL repo — files are read and passed to the workspace when you click Continue</div>
+              </div>
+              {tfReadFiles.length > 0 && (
+                <span style={{ marginLeft:"auto", fontSize:11, fontWeight:700, color:"#7C4DFF",
+                  background:"#7C4DFF18", border:"1px solid #7C4DFF44", borderRadius:10, padding:"2px 10px", flexShrink:0 }}>
+                  {tfReadFiles.length} file{tfReadFiles.length !== 1 ? "s" : ""}
+                </span>
+              )}
+            </div>
+
+            <div style={{ background:C.surface, border:`1px solid ${tfReadFiles.length ? "#7C4DFF66" : C.border}`, borderRadius:12, overflow:"hidden" }}>
+              {/* Drop zone */}
+              <div style={{ padding:"14px 16px" }}>
+                <div
+                  onDrop={async e => { e.preventDefault(); setTfDragging(false); const f = await collectDroppedFiles(e.dataTransfer); if (f.length) readTFFiles(f); }}
+                  onDragOver={e => { e.preventDefault(); setTfDragging(true); }}
+                  onDragLeave={() => setTfDragging(false)}
+                  style={{
+                    border:`2px dashed ${tfDragging ? "#7C4DFF" : C.border2}`,
+                    borderRadius:10, padding:"22px 20px", textAlign:"center",
+                    background: tfDragging ? "#7C4DFF10" : C.bg, transition:"all .2s",
+                  }}
+                >
+                  <div style={{ fontSize:26, marginBottom:6, opacity: tfDragging ? 1 : 0.5 }}>🏗</div>
+                  <div style={{...SANS, color:C.textMuted, fontSize:12, marginBottom:14}}>
+                    Drop .tf · .hcl · .sentinel · .tfvars · .cfn.json files or folders here — no size limit
+                  </div>
+                  <div style={{ display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap" }}>
+                    {'showDirectoryPicker' in window && (
+                      <button onClick={handleTFDirectoryPicker} style={{
+                        background:"#7C4DFF18", border:"1px solid #7C4DFF55",
+                        borderRadius:6, padding:"8px 18px", color:"#7C4DFF",
+                        fontSize:12, cursor:"pointer", ...SANS, display:"inline-flex", alignItems:"center", gap:6,
+                      }}>🗂 Open Folder (1GB+)</button>
+                    )}
+                    <label style={{
+                      background:`${C.accent}18`, border:`1px solid ${C.accent}55`,
+                      borderRadius:6, padding:"8px 18px", color:C.accent,
+                      fontSize:12, cursor:"pointer", ...SANS, display:"inline-flex", alignItems:"center", gap:6,
+                    }}>
+                      📁 Select Folder
+                      <input type="file" webkitdirectory="" multiple
+                        onChange={e => { if (e.target.files?.length) readTFFiles(e.target.files); e.target.value=""; }}
+                        style={{ display:"none" }} />
+                    </label>
+                    <label style={{
+                      background:C.surface, border:`1px solid ${C.border2}`,
+                      borderRadius:6, padding:"8px 18px", color:C.textSub,
+                      fontSize:12, cursor:"pointer", ...SANS, display:"inline-flex", alignItems:"center", gap:6,
+                    }}>
+                      <Upload size={13}/> Browse Files
+                      <input type="file" multiple accept=".tf,.hcl,.sentinel,.tfvars,.json"
+                        onChange={e => { if (e.target.files?.length) readTFFiles(e.target.files); e.target.value=""; }}
+                        style={{ display:"none" }} />
+                    </label>
+                  </div>
+                </div>
+
+                {/* TF read progress bar */}
+                {tfProgress && (
+                  <div style={{ marginTop:10, padding:"10px 14px", background:`#7C4DFF08`, borderRadius:8, border:"1px solid #7C4DFF22" }}>
+                    <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+                      <span style={{ fontSize:12, color:"#7C4DFF", fontWeight:500 }}>
+                        Reading {tfProgress.done} / {tfProgress.total} files
+                        {tfProgress.current ? ` · ${tfProgress.current}` : ""}
+                      </span>
+                      <span style={{ fontSize:12, fontWeight:700, color:"#7C4DFF" }}>
+                        {Math.round((tfProgress.done / Math.max(tfProgress.total, 1)) * 100)}%
+                      </span>
+                    </div>
+                    <div style={{ height:4, background:C.border, borderRadius:2, overflow:"hidden" }}>
+                      <div style={{
+                        height:"100%", borderRadius:2, background:"linear-gradient(90deg,#7C4DFF,#9C27B0)",
+                        width:`${Math.round((tfProgress.done / Math.max(tfProgress.total, 1)) * 100)}%`,
+                        transition:"width .3s ease",
+                      }} />
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ fontSize:10, color:C.textMuted, textAlign:"center", marginTop:8, ...SANS }}>
+                  Files are read locally — nothing leaves your browser · Analysis starts only after you click Continue
+                </div>
+              </div>
+
+              {/* TF file list */}
+              {tfReadFiles.length > 0 && (
+                <div style={{ borderTop:`1px solid ${C.border}`, padding:"10px 16px 14px", maxHeight:280, overflowY:"auto" }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+                    <span style={{ fontSize:11, fontWeight:600, color:C.textMuted }}>
+                      {tfReadFiles.length} file{tfReadFiles.length !== 1 ? "s" : ""} queued for analysis
+                    </span>
+                    <button onClick={() => setTfReadFiles([])} style={{
+                      background:"transparent", border:`1px solid ${C.border}`, borderRadius:5,
+                      padding:"2px 10px", color:C.textMuted, fontSize:11, cursor:"pointer", ...SANS,
+                    }}>Clear All</button>
+                  </div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
+                    {tfReadFiles.map((f, i) => {
+                      const ext = f.name.split(".").pop()?.toUpperCase().slice(0,8) || "FILE";
+                      const sizeKB = f.size ? (f.size / 1024).toFixed(0) : ((f.content?.length || 0) / 1024).toFixed(0);
+                      return (
+                        <div key={i} style={{
+                          display:"flex", alignItems:"center", gap:8, padding:"5px 10px",
+                          background:C.bg, borderRadius:6, border:`1px solid ${C.border}`,
+                        }}>
+                          <span style={{ fontSize:9, fontWeight:700, padding:"2px 5px", borderRadius:3, flexShrink:0,
+                            background:"#7C4DFF20", color:"#7C4DFF", border:"1px solid #7C4DFF44" }}>{ext}</span>
+                          <span style={{ ...SANS, fontSize:11, color:C.textSub, flex:1,
+                            overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{f.path || f.name}</span>
+                          <span style={{ fontSize:10, color:C.textMuted, flexShrink:0 }}>{sizeKB} KB</span>
+                          <button onClick={() => setTfReadFiles(prev => prev.filter((_,j) => j !== i))} style={{
+                            background:"transparent", border:"none", color:C.textMuted, cursor:"pointer",
+                            padding:"0 2px", borderRadius:3, display:"flex", alignItems:"center", flexShrink:0,
+                          }}
+                            onMouseEnter={e => e.currentTarget.style.color = "#EF5350"}
+                            onMouseLeave={e => e.currentTarget.style.color = C.textMuted}
+                          ><X size={12}/></button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
 
           {/* GROUP A */}
           <div id="group-a" style={{ marginBottom:32 }}>

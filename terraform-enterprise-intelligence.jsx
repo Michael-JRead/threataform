@@ -265,6 +265,10 @@ export default function App() {
   // reparseRef avoids TDZ: openModel wrapper is declared before reparse
   const reparseRef = useRef(null);
 
+  // appModeRef: tracked separately so effects can read current mode without re-subscribing
+  const appModeRef = useRef(appMode);
+  useEffect(() => { appModeRef.current = appMode; }, [appMode]);
+
   // Intelligence engine ref (declared early — needed by useUserDocs below)
   const intelligenceRef = useRef(new ThreatModelIntelligence());
   const [intelligenceVersion, setIntelligenceVersion] = useState(0);
@@ -411,17 +415,27 @@ export default function App() {
   useEffect(() => { archOverridesRef.current = archOverrides; }, [archOverrides]);
   useEffect(() => { archLayerAnalysisRef.current = archLayerAnalysis; }, [archLayerAnalysis]);
 
-  // Run 7-layer enterprise architecture analysis whenever TF files change
+  // Run 7-layer enterprise architecture analysis whenever TF files or userDocs change.
+  // Combines files[] with any TF-extension files that ended up in userDocs so that
+  // ALL terraform-related files are analysed regardless of which upload path was used.
   useEffect(() => {
-    if (!files.length) { setArchLayerAnalysis(null); setArchLayerVersion(0); return; }
+    const TF_EXT = /\.(tf|hcl|sentinel|tfvars)$/i;
+    const userDocsTF = (userDocsRef.current || []).filter(d =>
+      d.content && d.path && TF_EXT.test(d.path)
+    );
+    const existPaths = new Set(files.map(f => f.path));
+    const extraTF = userDocsTF.filter(d => !existPaths.has(d.path));
+    const allTF = extraTF.length ? [...files, ...extraTF] : files;
+
+    if (!allTF.length) { setArchLayerAnalysis(null); setArchLayerVersion(0); return; }
     try {
-      const analysis = architectureAnalyzer.analyzeArchitecture(files);
+      const analysis = architectureAnalyzer.analyzeArchitecture(allTF);
       setArchLayerAnalysis(analysis);
       setArchLayerVersion(v => v + 1);
     } catch (err) {
       console.warn('[ArchLayer] Analysis failed:', err);
     }
-  }, [files]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [files, userDocs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Stable refs so reparse ([] deps) and grade effect can always read current values
   const currentModelRef    = useRef(currentModel);
@@ -484,14 +498,15 @@ export default function App() {
   const intelRebuildTimerRef = useRef(null);
   useEffect(() => {
     clearTimeout(intelRebuildTimerRef.current);
-    intelRebuildTimerRef.current = setTimeout(() => {
+    intelRebuildTimerRef.current = setTimeout(async () => {
+      if (appModeRef.current === "documents") return; // skip while on upload page
       const pr = parseResultRef.current;
       const ctxDoc = buildModelContextDoc();
       const archDoc = buildArchContextDoc();
       const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
       const docsWithCtx = [...syntheticDocs, ...userDocs];
       intelligenceRef.current = new ThreatModelIntelligence();
-      intelligenceRef.current.build(docsWithCtx, pr?.resources||[], pr?.modules||[], archLayerAnalysisRef.current);
+      await intelligenceRef.current.build(docsWithCtx, pr?.resources||[], pr?.modules||[], archLayerAnalysisRef.current);
       setIntelligenceVersion(v => v+1);
       // Regenerate XML with enriched intelligence if we have parsed data
       if (pr && (pr.resources.length > 0 || pr.modules.length > 0)) {
@@ -611,7 +626,12 @@ export default function App() {
       if (!wllamaManager.isLoaded) break; // user unloaded model mid-run
       const batch = needEmbed.slice(i, i + BATCH);
       try {
-        const vectors = await wllamaManager.embed(batch.map(b => b.chunk.text));
+        // Sequential per-chunk embed — embed() accepts a single string, not an array
+        const vectors = [];
+        for (const b of batch) {
+          try { vectors.push(await wllamaManager.embed(b.chunk.text)); }
+          catch { vectors.push(null); }
+        }
         const batchPairs = [];
         batch.forEach((b, j) => {
           const vec = vectors[j];
@@ -746,7 +766,7 @@ export default function App() {
       setParseResult(null); setXml("");
       const seedDocs = [ctxDoc, archDoc].filter(Boolean);
       intelligenceRef.current = new ThreatModelIntelligence();
-      intelligenceRef.current.build(seedDocs, [], []);
+      await intelligenceRef.current.build(seedDocs, [], []);
       setIntelligenceVersion(v=>v+1);
       return;
     }
@@ -759,6 +779,7 @@ export default function App() {
       /\.cfn\.json$/i.test(f.name) || CFN_SIG.test(f.content || '')
     );
 
+    await new Promise(r => setTimeout(r, 0)); // yield before synchronous TF parse
     const result = parseTFMultiFile(hclFiles);
 
     // ── Parse CFN files and merge resources ───────────────────────────────────
@@ -777,7 +798,7 @@ export default function App() {
     const syntheticDocs = [ctxDoc, archDoc].filter(Boolean);
     const docsWithCtx = [...syntheticDocs, ...userDocsRef.current];
     intelligenceRef.current = new ThreatModelIntelligence();
-    intelligenceRef.current.build(docsWithCtx, result.resources, result.modules, archLayerAnalysisRef.current);
+    await intelligenceRef.current.build(docsWithCtx, result.resources, result.modules, archLayerAnalysisRef.current);
     setIntelligenceVersion(v => v+1);
 
     // H2: Persist session snapshot for "Recent Scans" history
@@ -812,6 +833,7 @@ export default function App() {
       });
     } catch { /* session history write failure is non-critical */ }
     if (result.resources.length > 0 || result.modules.length > 0) {
+      await new Promise(r => setTimeout(r, 0)); // yield before synchronous DFD generation
       const x = generateDFDXml(result.resources, result.modules, result.connections, intelligenceRef.current, archLayerAnalysisRef.current);
       setXml(x);
     } else {
@@ -1105,7 +1127,22 @@ export default function App() {
           onSaveDetails={saveModelDetails}
           onAddDocs={addUserDocs}
           onRemoveDoc={removeUserDoc}
-          onContinue={() => { setAppMode("workspace"); setMainTab("build"); }}
+          onContinue={(tfReadFiles) => {
+            setAppMode("workspace");
+            setMainTab("build");
+            if (tfReadFiles?.length) {
+              // MERGE with existing files (IDB-loaded or prior Build-tab uploads)
+              // so that architecture analysis sees ALL TF files from all sources.
+              const existing = filesRef.current;
+              const existPaths = new Set(existing.map(f => f.path));
+              const newFiles = tfReadFiles.filter(f => !existPaths.has(f.path));
+              const merged = [...existing, ...newFiles].sort((a,b) => a.path.localeCompare(b.path));
+              setFiles(merged);
+              const cm = currentModelRef.current;
+              if (cm) tfFilesPutAll(cm.id, merged);
+              reparse(merged);
+            }
+          }}
           onBack={() => setAppMode("landing")}
           ingestState={ingestState}
           intelligence={intelligenceRef.current}
