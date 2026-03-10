@@ -11,17 +11,22 @@ A browser-based, fully client-side security analysis platform for enterprise inf
 - [Quick Start](#quick-start)
 - [Workflow Overview](#workflow-overview)
 - [Features](#features)
-- [LLM Engine — ThreataformLM](#llm-engine--therataformlm)
+- [AI Assistant & LLM Stack](#ai-assistant--llm-stack)
+- [LLM Engine — ThreataformLM](#llm-engine--threataformlm)
 - [RAG Pipeline](#rag-pipeline)
 - [NLP Pipeline](#nlp-pipeline)
 - [File Ingestion](#file-ingestion)
 - [Training Pipeline](#training-pipeline)
 - [.tnlm Format Reference](#tnlm-format-reference)
-- [Intelligence Engine (BM25 Legacy)](#intelligence-engine-bm25-legacy)
+- [Intelligence Engine (BM25)](#intelligence-engine-bm25)
+- [IaC Parsing](#iac-parsing)
 - [DFD Output](#dfd-output)
+- [MCP Tool Server](#mcp-tool-server)
 - [TFE-Pave Pattern Support](#tfe-pave-pattern-support)
-- [Security & Privacy](#security--privacy)
+- [State Management](#state-management)
 - [Project Structure](#project-structure)
+- [Security & Privacy](#security--privacy)
+- [Tech Stack](#tech-stack)
 
 ---
 
@@ -29,18 +34,18 @@ A browser-based, fully client-side security analysis platform for enterprise inf
 
 ```bash
 npm install
-
-# Browser only
-npm run dev:web          # http://127.0.0.1:5173
-
-# Desktop app (Electron + Vite)
-npm run dev
-
-# Production build
-npm run build
+npm run dev          # http://127.0.0.1:5173
+npm run build        # production build → dist/
 ```
 
-**Generate smoke-test model before first use:**
+> **COOP/COEP headers are required.** The dev server sets these automatically. For production, configure your static file server to send:
+> ```
+> Cross-Origin-Opener-Policy: same-origin
+> Cross-Origin-Embedder-Policy: require-corp
+> ```
+> These are required for `SharedArrayBuffer` (multi-threaded llama.cpp WASM).
+
+**Generate smoke-test model before using the custom engine:**
 
 ```bash
 python scripts/create_dummy_model.py
@@ -50,16 +55,15 @@ python scripts/create_dummy_model.py
 
 ### Enterprise / Restricted npm Registry
 
-If your environment blocks the public npm registry (401 on all packages):
+If your environment blocks the public npm registry:
 
 ```bash
 npm install --omit=optional   # skip native binary optionals
-npm run dev:web
+npm run dev
 ```
 
 All document extractors (PDF, DOCX, XLSX, PPTX, images) automatically fall back to
-**esm.sh CDN** if their npm packages are unavailable — as long as the machine has internet
-access. CSV and plain-text formats need no library at all.
+**esm.sh CDN** if their npm packages are unavailable — as long as the machine has internet access.
 
 | Format | npm package | CDN fallback |
 |---|---|---|
@@ -70,29 +74,27 @@ access. CSV and plain-text formats need no library at all.
 | PNG/JPG | tesseract.js | esm.sh/tesseract.js@5.0.4 |
 | CSV | pure JS | — |
 
-> **Python alternative (future):** `pdfplumber`, `python-docx`, `openpyxl`, `python-pptx`
-> can serve extractions from a local sidecar (`python scripts/extract_server.py`) for
-> fully air-gapped environments. Not yet implemented.
-
 ---
 
 ## Workflow Overview
 
 ```
-Step 1 — Create Model
+Step 1 — Know Your Domain
+  Browse the built-in Knowledge Base (AWS services, STRIDE, ATT&CK, compliance)
+  ↓
+Step 2 — Build Model
   Name your threat model (e.g. "Kinesis Data Analytics", "EKS Platform")
+  Upload Terraform + supporting docs
+  Set application details (environment, team, data classification)
   ↓
-Step 2 — Supporting Documents
-  Upload categorized enterprise context documents
-  Select industry & threat modeling frameworks in scope
-  Describe key product features
+Step 3 — Analyze Threats
+  STRIDE breakdown · IaC misconfig checks · ATT&CK mapping · surface analysis
   ↓
-Step 3 — Workspace
-  Upload & parse Terraform files
-  Run Architecture Analysis (auto-populated from TF + docs)
-  Query the Intelligence engine / AI Assistant
-  Run Threataform security analysis
-  Export DFD to Lucidchart
+Step 4 — Review Intelligence
+  AI Assistant · Posture · Controls · Misconfigs · ATT&CK · Threat Intel · Scope
+  ↓
+Step 5 — Export
+  DFD .xml (draw.io/Lucidchart) · .lucid bundle · Report .txt / .md
 ```
 
 All state persists per-model in browser `localStorage`. Switch between models without losing context.
@@ -101,51 +103,92 @@ All state persists per-model in browser `localStorage`. Switch between models wi
 
 ## Features
 
-### Supporting Documents
-
-**Document Categories**
-| Category | Purpose |
-|---|---|
-| Enterprise Architecture | Platform type, AWS Org/OU/SCP docs, ADRs, SDLC processes |
-| Application / Product Details | HLDD, engineer docs, vendor documentation |
-| Enterprise Security Controls | Security control matrix, control baseline, known risks |
-| CSPM / Cloud Configuration | Wiz reports, cloud configuration rules, posture findings |
-| Customer Compliance Guide | CSP compliance guides cross-referenced with control matrix |
-| Trust on Cloud Documentation | Enterprise cloud trust framework documentation |
-
-**Framework Selection**
-- *Industry & Compliance:* NIST 800-53 r5, NIST CSF 2.0, CIS Controls v8, PCI DSS v4, HIPAA, FedRAMP Moderate, FedRAMP High, GDPR, ISO 27001, CMMC Level 2, SOC 2 Type II, NIST SP 800-207 (Zero Trust)
-- *Threat Modeling:* STRIDE, PASTA, VAST, LINDDUN, OCTAVE, RTMP, OWASP Top 10, OWASP Top 10 Cloud, MITRE ATT&CK, DREAD, TRIKE
-
-### Intelligence Tab
+### Intelligence Panel Sub-tabs
 
 | Sub-tab | Description |
 |---|---|
-| AI Assistant | BM25 + LLM hybrid chat — context-aware threat analysis |
-| Query Docs | Free-text BM25 search across all indexed documents |
-| Security Posture | NIST CSF 2.0 (40%) + Defense-in-Depth (35%) + Zero Trust (25%) composite score, A–F grade |
-| Control Inventory | Present/absent controls per defense-in-depth layer |
-| Misconfig Checks | 30+ automated checks (Checkov/tfsec-style) across all resources |
-| ATT&CK Mapping | MITRE ATT&CK v18.1 technique coverage from parsed resource types |
-| Threat Findings | STRIDE threat signals extracted from uploaded documents |
-| Scope Analysis | In-scope / out-of-scope declarations found across all indexed content |
-| Resource Intel | Per-resource BM25 query against all indexed documents |
+| **AI Assistant** | BM25 + LLM hybrid chat — context-aware threat analysis. Offline LLM optional; BM25 fallback always active. |
+| **Security Posture** | Aggregated security score, STRIDE breakdown, control coverage heatmap |
+| **Control Inventory** | Present/absent controls per defense-in-depth layer, with evidence passages |
+| **Cross-Doc Analysis** | Finds contradictions, gaps, and duplicates across uploaded documents |
+| **Misconfigs** | 30+ automated IaC checks (Checkov/tfsec-style) across all resources |
+| **ATT&CK Map** | MITRE ATT&CK v18.1 technique coverage grid by tactic |
+| **Threat Intel** | Per-resource threat details with CVSS estimates and remediation guidance |
+| **Scope** | In-scope / out-of-scope declarations extracted from uploaded documents |
 
-### Threataform Analysis Tab
+### Threat Analysis Tab
 
 - Executive summary with risk score and severity breakdown
-- Per-finding: resource ID, severity (CRITICAL/HIGH/MEDIUM/LOW), remediation guidance, CWE mapping, ATT&CK technique
+- Per-finding: resource ID, severity (CRITICAL/HIGH/MEDIUM/LOW), remediation, CWE mapping, ATT&CK technique
 - STRIDE-LM threat mapping per architectural tier
 - Trust boundary identification (network, compute, storage, IAM, org)
 - Full ATT&CK coverage heatmap
+- Security surface summary (S3, EKS, Lambda, WAF exposure)
+
+### Supported Frameworks
+
+**Compliance / Industry:** HIPAA, FedRAMP Moderate/High, PCI DSS v4, GDPR, SOC 2 Type II, CMMC Level 2, NIST 800-53 r5, NIST CSF 2.0, CIS Controls v8, ISO 27001, NIST SP 800-207 (Zero Trust)
+
+**Threat Modeling:** STRIDE, PASTA, VAST, LINDDUN, OCTAVE, RTMP, OWASP Top 10, OWASP Top 10 Cloud, MITRE ATT&CK, DREAD, TRIKE
+
+---
+
+## AI Assistant & LLM Stack
+
+Two engines exist. The **active engine** is `WllamaManager` (llama.cpp WASM, user picks a `.gguf` from disk). The **next-gen engine** is `ThreataformEngine` (auto-loads `public/model.tnlm`, uses Web Workers) — fully built but not yet wired as the default.
+
+### Active Engine — WllamaManager
+
+`src/lib/WllamaManager.js` wraps `@wllama/wllama` v2.3.7:
+
+- User selects any `.gguf` file from disk in the AI Assistant → **Load Local LLM** section
+- File is read locally via the File API — never uploaded
+- Multi-threaded WASM inference when `SharedArrayBuffer` is available; single-thread fallback is automatic
+- API: `loadFromFile(file)`, `generate(messages)` (async generator), `embed(texts[])`, `embedQuery(text)`
+
+### Next-Gen Engine — ThreataformEngine
+
+`src/lib/ThreataformEngine.js` (482 lines) — same public API as WllamaManager, drop-in replacement:
+
+- Auto-loads `public/model.tnlm` via `autoLoad()` — no user file picker
+- Runs `ThreataformLM-200M` (custom causal transformer, pure JS)
+- Uses `engineWorker.js` + `ingestWorker.js` Web Workers
+- Supports ColBERT multi-vector embeddings, HyDE query expansion, SelfRAG
+
+**To wire ThreataformEngine:** change `import { wllamaManager } from './src/lib/WllamaManager.js'` to `import { threataformEngine as wllamaManager } from './src/lib/ThreataformEngine.js'` in the main app file.
+
+### Current Chat Flow (WllamaManager + BM25 path)
+
+```
+User query
+  → BM25 search over indexed documents    [always active]
+  + Dense vector search via wllama embed  [when model loaded]
+        ↓
+  Reciprocal Rank Fusion (k=60)
+        ↓
+  Context Packer (fills token budget, deduplicates)
+        ↓
+  LLM generation (streamed tokens)  OR  BM25 top-k summary fallback
+```
+
+### Full RAG Flow (ThreataformEngine path — future default)
+
+```
+User query
+  → HyDE query expansion (generate hypothetical answer, embed it)
+  → HybridRetriever: BM25 + dense + ColBERT + RRF
+  → Cross-encoder reranking
+  → SELF-RAG generate loop ([Retrieve]/[IsRel]/[IsSup]/[IsUse])
+  → Streaming tokens to UI
+```
 
 ---
 
 ## LLM Engine — ThreataformLM
 
-### Architecture (ThreataformLM-200M)
+Custom causal transformer built from scratch in pure JavaScript for `ThreataformEngine`. No WASM, no WebGPU, no external inference libraries.
 
-Custom causal transformer built from scratch in pure JavaScript. No WASM, no WebGPU, no external inference libraries.
+### Architecture (ThreataformLM-200M)
 
 | Hyperparameter | Value |
 |---|---|
@@ -191,7 +234,7 @@ Every operation implemented from scratch over `Float32Array` / `Uint8Array`. No 
 | `greedySample(logits)` | Argmax decoding (temp=0) |
 | `sampleTopP(logits, temp, topP)` | Nucleus (top-p) sampling |
 | `sampleTopK(logits, temp, topK)` | Top-K sampling |
-| `f16ToF32(h)` | IEEE 754 half→float (pure bit manipulation, no ArrayBuffer tricks) |
+| `f16ToF32(h)` | IEEE 754 half→float (pure bit manipulation) |
 | `f32ToF16(f)` | IEEE 754 float→half |
 | `dequantQ4Block(raw, blockIdx)` | 18-byte Q4 block → 32 floats |
 | `dequantQ8Block(raw, blockIdx)` | 34-byte Q8 block → 32 floats |
@@ -204,7 +247,7 @@ Full byte-pair encoding (Sennrich et al. 2016) in pure JavaScript.
 
 - Unicode-aware pre-tokenization: splits on whitespace + punctuation boundaries preserving word integrity
 - Byte fallback: every Unicode character maps to UTF-8 byte tokens — guaranteed full coverage, no UNK tokens
-- 32K merge rules embedded as compressed JS object (train offline via `scripts/build_vocab.py` → `scripts/export_vocab.py`)
+- 32K merge rules embedded as compressed JS object
 - NFC normalization, BOM stripping, Windows line-ending normalization
 - LLaMA-3-compatible instruct chat template via `encodeChat(messages)`
 
@@ -220,8 +263,6 @@ Full byte-pair encoding (Sennrich et al. 2016) in pure JavaScript.
 | `<\|issup\|>` | 5 | SELF-RAG: response supported by evidence |
 | `<\|isuse\|>` | 6 | SELF-RAG: response usefulness score (1–5) |
 
-**Current state:** Tokenizer fully implemented. Running with a placeholder 1K-token vocabulary. To activate the full 32K vocab: run `scripts/build_vocab.py` → `scripts/export_vocab.py`, then copy the output constants into `Tokenizer.js`.
-
 ---
 
 ### `src/lib/llm/Model.js` — Forward Pass
@@ -232,7 +273,7 @@ ThreataformLM(config, weights)
   ├── generate(promptTokens, opts)       → async generator of token IDs (streaming)
   ├── embed(tokenIds)                    → Float32Array[dim] — single pooled vector
   ├── embedMulti(tokenIds)               → Float32Array[][dim] — per-token ColBERT vectors
-  ├── predictTokenProb(prompt, tokenId)  → float — used by SELF-RAG for [Retrieve]/[IsRel] etc.
+  ├── predictTokenProb(prompt, tokenId)  → float — used by SELF-RAG for special tokens
   ├── allocateKVCache(maxSeqLen)         → KVCache — pre-allocated Float32Arrays per layer
   └── clearKVCache()
 ```
@@ -246,8 +287,6 @@ ThreataformLM(config, weights)
 6. SwiGLU FFN: `silu(W_gate @ x) * (W_up @ x)` → `W_down`
 7. Residual add
 
-**Current state:** Full forward pass implemented and wired to `engineWorker.js`. Requires trained weights for meaningful output.
-
 ---
 
 ### `src/lib/llm/WeightsLoader.js` — Model Loading
@@ -255,7 +294,7 @@ ThreataformLM(config, weights)
 - Parses `.tnlm` binary format (see [.tnlm Format Reference](#tnlm-format-reference))
 - IndexedDB cache (`threataform-model-v1`): stores raw `ArrayBuffer`, second load is always from IDB (<2s)
 - Streaming load with per-tensor progress callbacks
-- `autoLoad()` — lazy-fetches `/model.tnlm` on first `generate()` or `embed()` call; no upfront cost
+- `autoLoad()` — lazy-fetches `/model.tnlm` on first `generate()` or `embed()` call
 
 ---
 
@@ -271,9 +310,8 @@ Low-Rank Adaptation on all 7 projections per layer (Q, K, V, O, gate, up, down) 
 | Loss | cross-entropy | Next-token prediction on document chunks |
 | Batch | 4 sequences | Micro-batching in Web Worker |
 
-- A matrices: Kaiming normal init; B matrices: zero init (delta = 0 at start, no disruption to base model)
+- A matrices: Kaiming normal init; B matrices: zero init (delta = 0 at start)
 - Manual backprop: `dL/dA = Bᵀ @ grad_out @ xᵀ`, `dL/dB = grad_out @ (A @ x)ᵀ`
-- Runs non-blocking in `engineWorker.js` with progress callbacks
 - Adapter serialized to `ArrayBuffer`, cached in IndexedDB, reloaded automatically
 
 ---
@@ -282,7 +320,7 @@ Low-Rank Adaptation on all 7 projections per layer (Q, K, V, O, gate, up, down) 
 
 Runs `ThreataformLM` in a dedicated Web Worker (no UI blocking).
 
-**Handled message types:**
+**Message types:**
 - `load` — fetch + parse `model.tnlm`, report progress
 - `generate` — streaming token generation, emits `{type:'token', token}` per step
 - `embed` — single-vector embedding for a text string
@@ -298,19 +336,15 @@ Runs `ThreataformLM` in a dedicated Web Worker (no UI blocking).
 
 **RecursiveTextSplitter** — deterministic, zero dependencies
 - Separator hierarchy (most structural → least): markdown headings → paragraph breaks → newlines → sentence ends (`[.!?]`) → clause ends (`[,;:]`) → word boundaries → character-level
-- `split(text)` → `string[]`
-- `splitWithMeta(text, meta)` → `{text, index, charStart, charEnd}[]`
 - Default: minChunk=100, maxChunk=800, overlap=50
 
 **SemanticChunker** (in `NLP.js`, re-exported from `Chunker.js`)
 - Embeds sequential sentence windows, detects cosine-similarity dips as semantic boundaries
-- Produces variable-size chunks preserving semantic coherence
 - Requires async `embedFn: string → Float32Array`
 
 **HierarchicalChunker** — two-pass (recommended for production)
-- Pass 1: RecursiveTextSplitter (fast, structural coarse split)
-- Pass 2: SemanticChunker refines any chunk still above `maxChunk`
-- Falls back to RecursiveTextSplitter only if no `embedFn` provided
+- Pass 1: RecursiveTextSplitter (fast structural split)
+- Pass 2: SemanticChunker refines chunks still above `maxChunk`
 
 ```js
 import { makeChunker } from './rag/Chunker.js';
@@ -328,7 +362,7 @@ const chunks = await chunker.chunk(text, embedFn);
 
 ### BM25 — `src/lib/rag/BM25Index.js`
 
-Classic Okapi BM25: k1=1.5, b=0.75. Stop-word filtered. Used as the primary retrieval stage and as the fallback when the neural model is not loaded.
+Classic Okapi BM25: k1=1.5, b=0.75. Stop-word filtered. Primary retrieval stage and fallback when no LLM is loaded.
 
 ---
 
@@ -336,15 +370,14 @@ Classic Okapi BM25: k1=1.5, b=0.75. Stop-word filtered. Used as the primary retr
 
 **SingleVectorStore** — one embedding per chunk
 - Cosine similarity ranking
-- Backed by HNSW for O(log N) ANN search at scale
+- HNSW for O(log N) ANN search at scale
 
 **ColBERTVectorStore** — one embedding per token (late interaction)
 - Stores `Float32Array[]` (T × dim) per document
-- MaxSim scoring: `score(Q, D) = Σᵢ max_j (qᵢ · dⱼ)` — far more accurate than single-vector for multi-aspect queries
+- MaxSim scoring: `score(Q, D) = Σᵢ max_j (qᵢ · dⱼ)`
 
 **HNSW** — Hierarchical Navigable Small World
 - Parameters: M=16 connections/node, efC=200 (construction), efS=50 (search)
-- Level assignment: `floor(-ln(rand) / ln(M))` → logarithmic layer distribution
 - O(log N) approximate nearest-neighbour; brute-force fallback below 50 vectors
 
 ---
@@ -363,11 +396,11 @@ Classic Okapi BM25: k1=1.5, b=0.75. Stop-word filtered. Used as the primary retr
 
 **Stage 2 — Reciprocal Rank Fusion**
 
-Merges all three ranked lists: `score(d) = Σᵣ 1/(60 + rankᵣ(d))`  (Cormack et al. 2009, k=60). Produces unified top-40.
+`score(d) = Σᵣ 1/(60 + rankᵣ(d))` (Cormack et al. 2009, k=60)
 
 **Stage 3 — Cross-encoder reranking**
 
-Uses `ThreataformLM` as a binary relevance classifier on concatenated `[query, passage]` pairs. Sorted by cross-encoder logit, top-K returned (default 8). Skipped if model not loaded.
+Uses `ThreataformLM` as a binary relevance classifier. Skipped when model not loaded.
 
 **Stage 4 — SELF-RAG filtering**
 
@@ -388,8 +421,6 @@ query
   → retrieve with combined signal
 ```
 
-Why: embedding a hypothetical answer is a much richer retrieval signal than embedding a short question. Especially effective for threat modeling queries like "what STRIDE threats apply to this S3 bucket?" where the hypothetical answer contains threat vocabulary not present in the raw question.
-
 Falls back to direct query embedding when model not loaded.
 
 ---
@@ -400,57 +431,18 @@ Self-Reflective RAG (Asai et al. 2023).
 
 | Special token | Threshold | Decision |
 |---|---|---|
-| `[Retrieve]` | P > 0.40 | Should we even retrieve? (skip for simple factual answers) |
+| `[Retrieve]` | P > 0.40 | Should we even retrieve? |
 | `[IsRel]` | P > 0.50 | Is this retrieved passage relevant? |
 | `[IsSup]` | P > 0.40 | Does the response use this passage as evidence? |
-| `[IsUse]` | score ≥ 3 | Is the final response useful on a 1–5 scale? |
+| `[IsUse]` | score ≥ 3 | Is the final response useful (1–5 scale)? |
 
 **Generation loop:**
 1. Predict `[Retrieve]` — skip retrieval if query is self-contained
 2. Retrieve candidates via `HybridRetriever`
-3. Filter by `[IsRel]` per passage — discard irrelevant before generation
+3. Filter by `[IsRel]` per passage — discard irrelevant
 4. Generate with each surviving passage independently
 5. Score each output by `[IsSup]` + `[IsUse]`
-6. Return the highest-scoring response (or beam over top-N passages)
-
-**Current state:** SELF-RAG fully implemented. Special token IDs wired through `Tokenizer.js`. Requires a model trained with SELF-RAG tokens in the vocabulary to predict these probabilities meaningfully. With the smoke-test model, `[Retrieve]` will fire randomly and the loop falls through to BM25 context packing.
-
----
-
-### Active Chat Flow (current state with smoke-test model)
-
-The AI Assistant currently uses the **legacy BM25 fallback path** (`ThrataformRAG.js`):
-
-```
-User query
-  → BM25 search over indexed documents
-  → ContextPacker (top-K chunks ranked by BM25 score)
-  → Format as markdown: "**Relevant content from your documents:** ..."
-  → Display verbatim chunk text
-```
-
-No neural generation is active. Responses are retrieved context chunks, not generated prose. When real trained weights are placed at `public/model.tnlm`, the full pipeline activates automatically:
-
-```
-User query
-  → HyDE query expansion (ThreataformLM.generate)
-  → HybridRetriever (BM25 + dense + ColBERT + RRF)
-  → Cross-encoder reranking
-  → SELF-RAG generate loop
-  → Streaming tokens to UI
-```
-
----
-
-### `src/workers/ingestWorker.js` — Ingestion Worker
-
-Handles file processing off the main thread:
-1. `FileRouter` extracts text from any file type
-2. `HierarchicalChunker` splits text into chunks
-3. `ThreataformEngine.embed()` generates vectors (or skips if model not loaded)
-4. Vectors stored in `ColBERTVectorStore` + `SingleVectorStore`
-5. `BM25Index` updated with new chunks
-6. Progress callbacks to UI
+6. Return the highest-scoring response
 
 ---
 
@@ -460,25 +452,22 @@ Handles file processing off the main thread:
 
 | Class / Function | Description |
 |---|---|
-| `SecurityNER` | Recognizes: CVE IDs, MITRE T-numbers, AWS resource types, CIS control refs, IPs, ports, hostnames, Terraform resource names, compliance frameworks (HIPAA, FedRAMP, SOC2, PCI, GDPR, CMMC) |
-| `SemanticChunker` | Embedding-based sentence-boundary detection — cosine dip = chunk boundary |
-| `CoreferenceResolver` | Pronoun → antecedent linking ("it", "they", "the system" → actual entity) |
+| `SecurityNER` | Recognizes: CVE IDs, MITRE T-numbers, AWS resource types, CIS control refs, IPs/ports, Terraform resource names, compliance framework names |
+| `SemanticChunker` | Embedding-based sentence-boundary detection |
+| `CoreferenceResolver` | Pronoun → antecedent linking ("it", "the system" → actual entity) |
 | `RelationExtractor` | Subject-predicate-object triples, e.g. `{S3 bucket, exposes, public internet}` |
-| `detectLanguage(text)` | Trigram frequency model, 50 languages, ~50KB embedded data |
-| `segmentSentences(text)` | Handles code blocks, URLs, abbreviations correctly |
+| `detectLanguage(text)` | Trigram frequency model, 50 languages |
+| `segmentSentences(text)` | Handles code blocks, URLs, abbreviations |
 
 ---
 
 ## File Ingestion
 
-All extractors lazy-loaded via `src/lib/ingestion/FileRouter.js` (routes by MIME type + extension).
-
-Each extractor attempts **npm package first**, then **esm.sh CDN fallback** automatically.
-No configuration required — works on restricted enterprise networks as long as internet access exists.
+`src/lib/ingestion/FileRouter.js` routes by MIME type + extension.
 
 | Format | Primary Library | CDN Fallback | Output |
 |---|---|---|---|
-| PDF | pdfjs-dist | esm.sh/pdfjs-dist@3.11.174 | Text + table detection (column analysis) |
+| PDF | pdfjs-dist | esm.sh/pdfjs-dist@3.11.174 | Text + table detection |
 | DOCX/DOC | mammoth | esm.sh/mammoth@1.6.0 | Heading hierarchy, tables, metadata |
 | XLSX/XLS | SheetJS (xlsx) | esm.sh/xlsx@0.18.5 | "ColHeader: CellValue" row format |
 | CSV | pure JS | — | First row as headers, labelled sentences |
@@ -486,11 +475,10 @@ No configuration required — works on restricted enterprise networks as long as
 | PNG/JPG/TIFF | Tesseract.js | esm.sh/tesseract.js@5.0.4 | OCR text + layout analysis |
 | MP3/WAV/MP4 | Whisper.js | — | Audio transcription (lazy-loaded) |
 | JSON/YAML | built-in | — | Flattened `key.subkey.leaf: value` |
-| HCL/Terraform | custom parser | — | Resource blocks with all attributes annotated |
+| HCL/Terraform | custom parser | — | Resource blocks with all attributes |
 | HTML | DOMParser | — | Text nodes + tag context |
-| Markdown | built-in | — | Stripped syntax + code blocks extracted separately |
-| XML | DOMParser | — | Text nodes |
-| TOML | built-in | — | Parsed + flattened like JSON |
+| Markdown | built-in | — | Stripped syntax + code blocks |
+| TOML | built-in | — | Parsed + flattened |
 
 All extractors return:
 ```js
@@ -530,23 +518,17 @@ python scripts/build_vocab.py
 
 # 2. Download + preprocess corpus (CPU, multi-hour, ~50GB disk)
 python scripts/build_corpus.py
-#    → tokenized + packed HDF5 dataset
 
 # 3. Generate synthetic Q&A (requires OPENAI_API_KEY, run once)
 python scripts/generate_synth_data.py
-#    → 100K (prompt, response) JSONL pairs
 
 # 4. Pre-training (1× A100 ~3 days, 4× RTX 4090 ~5 days)
-#    AdamW lr=3e-4, cosine decay, 2000 warmup steps
-#    32 seqs × 4096 tokens = 131K tokens/batch, 200K steps (~26B tokens)
 python scripts/train_base.py
 
 # 5. Supervised fine-tuning (few hours)
-#    LLaMA-3 instruct template, loss on assistant turns only, lr=1e-5
 python scripts/train_instruct.py
 
 # 6. DPO alignment (few hours)
-#    beta=0.1 KL penalty, 10K (chosen, rejected) pairs, 2000 steps
 python scripts/train_dpo.py
 
 # 7. Quantize + export
@@ -559,7 +541,7 @@ python scripts/export_vocab.py
 python scripts/eval.py --model public/model.tnlm --all --save-report report.json
 ```
 
-### Evaluation Benchmarks (`scripts/eval.py`)
+### Evaluation Benchmarks
 
 | Benchmark | Metric | What it tests |
 |---|---|---|
@@ -567,7 +549,7 @@ python scripts/eval.py --model public/model.tnlm --all --save-report report.json
 | MITRE ATT&CK recall | Recall@10 | Attack scenario → correct T-numbers |
 | CIS control recommendation | Precision@5 | Misconfiguration → correct CIS controls |
 | Perplexity | PPL | Held-out security text perplexity |
-| RAG retrieval | MRR, NDCG, Hit@5 | BM25 retrieval quality |
+| RAG retrieval | MRR, NDCG, Hit@5 | Retrieval quality |
 | Threat Q&A | BLEU-4, ROUGE-L | Full answer quality vs reference answers |
 
 ---
@@ -593,18 +575,18 @@ F32: 4 bytes per element (IEEE 754 LE float)
 
 Q4: ceil(n/32) × 18 bytes
   Per 32-weight block:
-    [2B]  f16 scale (IEEE 754 LE half) = max_abs / 7
+    [2B]  f16 scale = max_abs / 7
     [16B] nibbles
-      byte[i]: low  nibble = weight[i]       → dequant: ((byte & 0x0F) - 8) × scale
-               high nibble = weight[i + 16]  → dequant: ((byte >> 4)   - 8) × scale
+      byte[i]: low  nibble = weight[i]       → ((byte & 0x0F) - 8) × scale
+               high nibble = weight[i + 16]  → ((byte >> 4)   - 8) × scale
 
 Q8: ceil(n/32) × 34 bytes
   Per 32-weight block:
     [2B]  f16 scale = max_abs / 127
-    [32B] int8 values → dequant: int8 × scale
+    [32B] int8 values → int8 × scale
 ```
 
-**Weight naming convention** (must match exactly for `Model.js`):
+**Weight naming convention:**
 
 ```
 tok_embeddings                    [vocab_size, dim]          F32
@@ -613,43 +595,109 @@ layers.{l}.attention_norm         [dim]                      F32
 layers.{l}.attention.wq           [n_heads×head_dim, dim]    Q4
 layers.{l}.attention.wk           [n_kv_heads×head_dim, dim] Q4
 layers.{l}.attention.wv           [n_kv_heads×head_dim, dim] Q4
-layers.{l}.attention.wo           [dim, dim]                 Q8  ← higher precision
+layers.{l}.attention.wo           [dim, dim]                 Q8
 layers.{l}.ffn_norm               [dim]                      F32
 layers.{l}.feed_forward.w1        [ffn_hidden, dim]          Q4
 layers.{l}.feed_forward.w3        [ffn_hidden, dim]          Q4
-layers.{l}.feed_forward.w2        [dim, ffn_hidden]          Q8  ← higher precision
+layers.{l}.feed_forward.w2        [dim, ffn_hidden]          Q8
 ```
 
-Q8 used for output projections (`attention.wo`, `feed_forward.w2`) where precision loss has the most impact on output quality.
+Q8 used for output projections (`attention.wo`, `feed_forward.w2`) where precision loss has most impact.
 
 ---
 
-## Intelligence Engine (BM25 Legacy)
+## Intelligence Engine (BM25)
 
-`ThreatModelIntelligence` in `terraform-enterprise-intelligence.jsx` — the original BM25-lite engine, active as the fallback when the neural model is not loaded.
+`src/lib/intelligence/ThreatModelIntelligence.js` — pure-JavaScript BM25-based engine. Active with or without an LLM loaded.
 
 ### Index Sources
 
 | Source | Content |
 |---|---|
-| Terraform resources | Resource type, name, ATT&CK techniques, misconfig check descriptions |
+| Terraform resources | Resource type, name, ATT&CK techniques, misconfiguration check descriptions |
 | User documents | Full extracted text chunked at ~400 tokens with 50-token overlap |
-| Model context doc | Synthetic doc: product name, environment, frameworks, key features |
+| Arch context doc | Synthetic doc: product name, environment, frameworks, key features |
+| Model details doc | Architecture description, data classifications, team fields |
 
 ### Entity Patterns Extracted
 
 STRIDE threats, MITRE ATT&CK T-numbers, compliance framework names, 100+ AWS service patterns, security control keywords, scope declarations (in-scope / out-of-scope language).
 
+### Key Methods
+
+| Method | Description |
+|---|---|
+| `build(userDocs, resources, modules)` | Index all sources, extract features |
+| `query(text, topK)` | BM25 search, returns verbatim chunks with scores |
+| `analyzeResource(type, name)` | Relevant doc passages for a specific resource |
+| `getArchitectureSummary(resources)` | Auto-fills the architecture description field |
+| `_docHasControl(ctrlName)` | Cross-references control against uploaded docs |
+
+The engine rebuilds automatically on every file upload, document change, or architecture override.
+
+---
+
+## IaC Parsing
+
+### Terraform / HCL — `src/lib/iac/TerraformParser.js`
+
+- Resource blocks: `aws_*`, `azurerm_*`, `google_*`, and custom providers
+- Module calls with Terraform Registry source inference
+- Output and variable dependencies
+- Cross-file connections: security groups → EC2, IAM roles → Lambda, VPC → subnets
+- Sentinel policy files, `.tfvars` value injection
+
+### CloudFormation — `src/lib/iac/CFNParser.js`
+
+Parses CloudFormation JSON/YAML stacks (Resources, Parameters, Outputs).
+
+### Security Analysis — `src/lib/iac/SecurityAnalyzer.js`
+
+| Category | Examples |
+|---|---|
+| Network exposure | Security groups with `0.0.0.0/0` ingress on sensitive ports |
+| Encryption | S3 without SSE, RDS without `storage_encrypted`, EBS without `encrypted` |
+| Access control | IAM policies with `*` actions/resources, missing MFA |
+| Logging/audit | CloudTrail disabled, S3 access logging off, VPC flow logs absent |
+| Public access | Public S3 ACLs, unrestricted Lambda URLs, public EKS API endpoints |
+| Versioning | S3 versioning disabled, DynamoDB PITR off |
+
 ---
 
 ## DFD Output
 
-Generated XML conforms to `mxGraphModel` (draw.io / Lucidchart standard).
+`src/lib/diagram/DFDGenerator.js` produces mxGraphModel XML for draw.io / Lucidchart.
 
-- **Layout:** Left-to-right, tiers as columns, max 5 nodes per sub-column
-- **Edge styles:** grey (implicit TF reference), red dashed (explicit `depends_on`), green (module I/O)
-- **Threat annotations:** Resources with STRIDE findings get a `⚠ stride1,stride2` label
-- **Import:** Lucidchart → File → Import → Diagram → select `.xml`
+**Layout:** Left-to-right tiers. Resources grouped by service type into tier columns, max 5 nodes per sub-column. Legend top-left.
+
+**XML format (immutable — Lucidchart import depends on this):**
+- All nodes: `html=1;whiteSpace=wrap;`
+- Edges: `edgeStyle=orthogonalEdgeStyle;...endArrow=blockThin;`
+- Newlines in cell values: `&#xa;`
+- Wrapper: `<mxfile host="app.diagrams.net" version="21.0.0" type="device">`
+
+**Edge types:**
+- Grey — implicit Terraform reference
+- Red dashed — explicit `depends_on`
+- Green — module I/O
+
+Resources with STRIDE findings get a `⚠ stride1,stride2` label appended.
+
+**Import:** Lucidchart → File → Import → Diagram → select `.xml`; or draw.io → Extras → Edit Diagram.
+
+---
+
+## MCP Tool Server
+
+`src/lib/mcp/MCPToolRegistry.js` implements a Model Context Protocol tool registry. The AI Assistant can invoke these as part of its reasoning.
+
+| Tool | Description |
+|---|---|
+| `score_cvss` | CVSS v3.1 base score from vector string |
+| `lookup_mitre` | ATT&CK technique details by technique ID |
+| `check_compliance` | Evaluates a control against HIPAA/FedRAMP/SOC2/PCI-DSS/GDPR/CMMC |
+
+External MCP tools can be connected via WebSocket through `MCPClient.js`.
 
 ---
 
@@ -665,77 +713,159 @@ Understands enterprise hierarchical IAM layers:
 | L3 | Product Pave | Platform VPC, TGW, shared SGs, ProductTeamDeployer role |
 | L4 | Service | Application workloads, service-specific roles |
 
-Context-aware wildcard IAM analysis: `kinesis:*` scoped to `team-prefix-*` with permission boundary present = LOW severity (standard pave pattern), not HIGH.
+Context-aware IAM analysis: `kinesis:*` scoped to `team-prefix-*` with permission boundary = LOW severity (standard pave pattern), not HIGH.
 
 ---
 
-## Security & Privacy
+## State Management
 
-- 100% client-side — Terraform code and documents never leave your browser
-- All parsing, OCR, intelligence indexing, and inference runs in the browser's JS engine / Web Workers
-- No telemetry, no analytics, no external API calls
-- `localStorage` keys: `tf-threat-models`, `tf-model-{id}-docs`, `tf-model-{id}-details`, `tf-model-{id}-files`, `tf-model-{id}-arch-analysis`
-- IndexedDB: `threataform-vectors` (BM25+vector data), `threataform-model-v1` (model weights cache)
+React hooks only — no external state library.
+
+| State | Hook | Description |
+|---|---|---|
+| `files` | `useParseResult` | Parsed TF/HCL file objects |
+| `parseResult` | `useParseResult` | Output of `parseTFMultiFile()` — resources, modules, connections |
+| `xml` | `useParseResult` | Current DFD mxGraphModel XML string |
+| `userDocs` | `useUserDocs` | Non-TF context documents (persisted per model) |
+| `currentModel` | `useModelManager` | Active threat model (name, id, metadata) |
+| `llmStatus` | `useLLM` | `idle` / `loading` / `ready` / `error` |
+| `wllamaModelName` | `useLLM` | Filename of loaded GGUF |
+| `llmProgress` | `useLLM` | Loading progress 0–100 |
+| `intelligenceRef` | `useRef` | `ThreatModelIntelligence` singleton |
+| `intelligenceVersion` | `useState` | Incremented after each index rebuild to trigger re-renders |
+| `vectorStoreRef` | `useVectorStore` | Dense vector store for RAG embeddings |
+
+**Persistence:**
+- Models list: `localStorage` → `tf-models`
+- Documents per model: `localStorage` → `tf-model-{id}-docs`
+- Chat history per model: `localStorage` → `tf-model-{id}-chat`
+- Last-used LLM model name: `localStorage` → `tf-last-llm-model`
+- Dense embedding vectors: IndexedDB → `threataform-vectors` (v2)
+- Model weights cache: IndexedDB → `threataform-model-v1`
+
+### Known Bug Pattern: TDZ in `useCallback` Deps
+
+If callback A (declared earlier in the component body) lists callback B (declared later) in its dep array, JavaScript throws a Temporal Dead Zone error:
+
+```
+Cannot access 'B' before initialization
+```
+
+**Fix:** Declare `const bRef = useRef(null)` before A, assign `bRef.current = B` after B is defined, call `bRef.current?.()` inside A.
 
 ---
 
 ## Project Structure
 
 ```
-src/
-  lib/
-    llm/
-      Ops.js                All math primitives — matmul, RMSNorm, RoPE, SwiGLU, Q4/Q8 dequant
-      Tokenizer.js          BPE tokenizer, 32K vocab, SELF-RAG special tokens, instruct template
-      Model.js              ThreataformLM-200M forward pass + generate + embed + LoRA hooks
-      WeightsLoader.js      .tnlm binary parser + IndexedDB cache + autoLoad
-      LoRA.js               168 adapter pairs, AdamW optimizer, manual backprop
-      NLP.js                SecurityNER, SemanticChunker, CoreferenceResolver, RelationExtractor
-    rag/
-      Chunker.js            RecursiveTextSplitter + HierarchicalChunker + makeChunker factory
-      BM25Index.js          BM25 (k1=1.5, b=0.75) keyword retrieval
-      VectorStore.js        SingleVectorStore + ColBERTVectorStore + HNSW
-      HybridRetriever.js    BM25 + dense + ColBERT + RRF + cross-encoder (4-stage)
-      HyDE.js               Hypothetical Document Embeddings query expansion
-      SelfRAG.js            SELF-RAG loop with [Retrieve]/[IsRel]/[IsSup]/[IsUse] tokens
-    ingestion/
-      FileRouter.js         MIME/extension routing
-      PDFExtractor.js       pdfjs-dist — text + tables + figures
-      DocxExtractor.js      mammoth — headings, tables, metadata
-      SpreadsheetExtractor.js  SheetJS — cell context format
-      PresentationExtractor.js PPTX XML — slides + speaker notes
-      ImageExtractor.js     Tesseract.js OCR (lazy)
-      AudioExtractor.js     Whisper.js transcription (lazy)
-      StructuredExtractor.js   JSON/YAML/HCL/XML/TOML → annotated text
-      MarkupExtractor.js    HTML/Markdown/RST → clean text + code blocks
-    ThreataformEngine.js    Public singleton API — loadModel, generate, embed, ingest
-    WllamaManager.js        Legacy shim re-exporting ThreataformEngine
-    ThrataformRAG.js        Legacy BM25 fallback (active with smoke-test model)
-  workers/
-    engineWorker.js         Inference + embedding + LoRA training Web Worker
-    ingestWorker.js         File chunking + embedding Web Worker
-    llmWorker.js            Legacy wllama worker
-    embedWorker.js          Legacy embed worker
-  terraform-enterprise-intelligence.jsx   Main application (~9200 lines)
-
-scripts/
-  create_dummy_model.py     Smoke-test .tnlm generator (Python stdlib, no GPU, ~300KB output)
-  build_vocab.py            Train 32K BPE vocabulary from security corpus
-  build_corpus.py           Download + preprocess training data
-  generate_synth_data.py    100K synthetic threat Q&A pairs via GPT-4o (one-time)
-  train_base.py             Pre-train ThreataformLM-200M from scratch
-  train_instruct.py         SFT on threat modeling instruction data
-  train_dpo.py              DPO alignment
-  quantize.py               F32 → mixed Q4/Q8 + .tnlm export
-  export_vocab.py           Trained vocab → Tokenizer.js constants
-  eval.py                   6-benchmark evaluation suite
-
-public/
-  model.tnlm                Model weights (smoke-test: 300KB random; production: ~50MB trained)
-
-electron/
-  main.cjs                  Electron main process
+threataform/
+├── terraform-enterprise-intelligence.jsx   # Main App component (~2848 lines)
+├── src/
+│   ├── hooks/
+│   │   ├── useLLM.js              # LLM/embed state (llmStatus, progress, model name/size)
+│   │   ├── useModelManager.js     # Threat model CRUD (localStorage persistence)
+│   │   ├── useUserDocs.js         # Document management + IDB cache purge on remove
+│   │   ├── useParseResult.js      # files / parseResult / xml state
+│   │   └── useVectorStore.js      # VectorStore + ColBERTVectorStore refs
+│   ├── components/
+│   │   ├── KBPanel.jsx            # Knowledge base accordion viewer
+│   │   ├── UserDocsPanel.jsx      # Document upload + management panel
+│   │   └── ScopeSelector.jsx      # In-scope / out-of-scope tag selector
+│   ├── features/
+│   │   ├── intelligence/
+│   │   │   ├── IntelligencePanel.jsx        # Intelligence hub (8 sub-tabs)
+│   │   │   ├── panelHelpers.jsx             # SEV_COLOR, renderMarkdown, chunkCard, etc.
+│   │   │   └── tabs/
+│   │   │       ├── AIAssistantTab.jsx
+│   │   │       ├── PostureControlsTab.jsx
+│   │   │       ├── CrossDocTab.jsx
+│   │   │       ├── MisconfigsTab.jsx
+│   │   │       ├── ThreatIntelTab.jsx
+│   │   │       ├── ScopeTab.jsx
+│   │   │       ├── ResourceIntelTab.jsx
+│   │   │       └── ArchLayersTab.jsx
+│   │   ├── analysis/
+│   │   │   ├── AnalysisPanel.jsx            # STRIDE / threat analysis tab
+│   │   │   └── AnalysisErrorBoundary.jsx
+│   │   └── pages/
+│   │       ├── LandingPage.jsx              # Model creation / selection screen
+│   │       └── DocumentsPage.jsx            # Build Model tab (upload + app details)
+│   ├── constants/
+│   │   ├── layout.js              # NW=84, NH=60, HGAP=18, VGAP=12, LEGEND_W=252, etc.
+│   │   └── styles.js              # C (color palette), MONO, SANS, SEV_COLOR, card(), sectionBar()
+│   ├── data/
+│   │   └── kb-domains.js          # Built-in knowledge base content (KB object by domain)
+│   └── lib/
+│       ├── WllamaManager.js       # Active LLM engine — llama.cpp WASM via @wllama/wllama
+│       ├── ThreataformEngine.js   # Next-gen engine (auto-loads model.tnlm) — not yet wired
+│       ├── ThrataformRAG.js       # RAG: RecursiveTextSplitter, BM25Index, VectorStore, hybridSearch
+│       ├── observability.js       # LOG, ThreataformError, createInferenceTracker, logHybridSearch
+│       ├── diagram/
+│       │   ├── DFDGenerator.js    # mxGraphModel XML generation
+│       │   ├── LegendBuilder.js   # DFD legend cell builder
+│       │   └── ExportUtils.js     # .lucid bundle + text/markdown report generation
+│       ├── iac/
+│       │   ├── TerraformParser.js
+│       │   ├── CFNParser.js
+│       │   ├── SecurityAnalyzer.js
+│       │   ├── PolicyEvaluator.js
+│       │   └── OrgTreeBuilder.js
+│       ├── intelligence/
+│       │   ├── ThreatModelIntelligence.js   # BM25 intelligence engine
+│       │   └── ArchitectureAnalyzer.js
+│       ├── rag/
+│       │   ├── BM25Index.js
+│       │   ├── VectorStore.js       # SingleVectorStore + ColBERTVectorStore + HNSW
+│       │   ├── HybridRetriever.js   # 4-stage: BM25 + dense + ColBERT + RRF
+│       │   ├── Chunker.js           # RecursiveTextSplitter, SemanticChunker, makeChunker
+│       │   ├── HyDE.js              # Hypothetical Document Embeddings
+│       │   └── SelfRAG.js           # Self-reflective retrieval loop
+│       ├── ingestion/
+│       │   ├── FileRouter.js
+│       │   ├── PDFExtractor.js
+│       │   ├── DocxExtractor.js
+│       │   ├── SpreadsheetExtractor.js
+│       │   ├── PresentationExtractor.js
+│       │   ├── ImageExtractor.js
+│       │   ├── AudioExtractor.js
+│       │   ├── MarkupExtractor.js
+│       │   └── StructuredExtractor.js
+│       ├── llm/
+│       │   ├── Model.js             # ThreataformLM-200M forward pass, generate, embed
+│       │   ├── Tokenizer.js         # BPE tokenizer, 32K vocab, SELF-RAG tokens
+│       │   ├── WeightsLoader.js     # .tnlm parser + IDB cache + autoLoad
+│       │   ├── Ops.js               # All math primitives (matmul, RMSNorm, RoPE, etc.)
+│       │   ├── NLP.js               # SecurityNER, SemanticChunker, CoreferenceResolver
+│       │   └── LoRA.js              # In-browser fine-tuning, 168 adapter pairs
+│       └── mcp/
+│           ├── MCPToolRegistry.js   # Built-in MCP tools
+│           ├── MCPClient.js         # WebSocket MCP client for external tools
+│           └── tools/
+│               ├── CVSSScorer.js
+│               ├── ThreatDBTool.js
+│               └── ComplianceChecker.js
+├── src/workers/
+│   ├── engineWorker.js            # ThreataformLM inference + LoRA training Web Worker
+│   ├── ingestWorker.js            # File chunking + embedding Web Worker
+│   ├── llmWorker.js               # wllama generation worker (active)
+│   └── embedWorker.js             # wllama embedding worker (active)
+├── public/
+│   ├── model.tnlm                 # ThreataformLM weights (smoke-test: 300KB; prod: ~50MB)
+│   └── manifest.webmanifest       # PWA manifest
+├── scripts/                       # Python training pipeline (see Training Pipeline section)
+├── vite.config.js                 # Vite + vite-plugin-pwa configuration
+└── package.json
 ```
+
+---
+
+## Security & Privacy
+
+- **100% client-side.** Terraform code and documents never leave your browser.
+- **No telemetry.** No analytics, no crash reporting, no external API calls from the app.
+- **Files never uploaded.** Processed locally via the File API and Web Workers.
+- **Air-gap compatible.** PWA service worker caches the app shell for offline-first loading. GGUF models loaded from disk work without any network connection.
+- **IndexedDB only.** Embedding vectors and model weights cached in the browser's local IndexedDB.
 
 ---
 
@@ -744,15 +874,17 @@ electron/
 | Layer | Technology |
 |---|---|
 | UI | React 18, Lucide icons, inline CSS |
-| Build | Vite 6, Electron 40 |
-| LLM inference | Pure JS Web Workers — engineWorker.js (no WASM) |
-| Legacy LLM | @wllama/wllama 2.3.7 (llama.cpp WASM, still bundled) |
-| PDF extraction | pdfjs-dist 5.x |
-| DOCX extraction | mammoth 1.x |
+| Build | Vite 5.4, vite-plugin-pwa |
+| Active LLM | @wllama/wllama 2.3.7 (llama.cpp WASM, user-loaded .gguf) |
+| Custom LLM | ThreataformLM-200M (pure JS, engineWorker.js, loads model.tnlm) |
+| PDF extraction | pdfjs-dist 4.10 |
+| DOCX extraction | mammoth 1.8 |
 | XLSX extraction | SheetJS 0.18 |
-| OCR | Tesseract.js 7.x |
+| OCR | Tesseract.js |
+| ZIP / PPTX | jszip 3.10 |
 | Diagrams | draw.io / Lucidchart mxGraph XML |
 | Persistence | localStorage (model state) + IndexedDB (vectors + model cache) |
+| PWA | vite-plugin-pwa — offline-first service worker |
 
 ---
 
@@ -762,7 +894,7 @@ electron/
 - [HashiCorp Terraform](https://developer.hashicorp.com/terraform)
 - [AWS Security Reference Architecture](https://docs.aws.amazon.com/prescriptive-guidance/latest/security-reference-architecture/welcome.html)
 - [CIS AWS Foundations Benchmark](https://www.cisecurity.org/benchmark/amazon_web_services)
-- [STRIDE](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats) (Microsoft)
+- [STRIDE](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats) — Microsoft
 - [SELF-RAG](https://arxiv.org/abs/2310.11511) — Asai et al. 2023
 - [HyDE](https://arxiv.org/abs/2212.10496) — Gao et al. 2022
 - [ColBERT](https://arxiv.org/abs/2004.12832) — Khattab & Zaharia 2020
