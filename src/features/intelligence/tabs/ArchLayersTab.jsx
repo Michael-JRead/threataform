@@ -1,5 +1,5 @@
 // src/features/intelligence/tabs/ArchLayersTab.jsx
-import React from 'react';
+import React, { useState } from 'react';
 import { C, MONO, SANS } from '../../../constants/styles.js';
 import { SEV_COLOR, STRIDE_COLORS, STRIDE_LABELS, COMPLIANCE_LABELS, catColor, catPill } from '../panelHelpers.jsx';
 import { generateTXTReport, generateMarkdownReport } from '../../../lib/diagram/ExportUtils.js';
@@ -33,7 +33,17 @@ export const ArchLayersTab = React.memo(function ArchLayersTab(ctx) {
     threatScenarios, setThreatScenarios, threatScenariosLoading, setThreatScenariosLoading,
     query, setQuery, results, setResults, queryLoading, setQueryLoading,
     noData, hasUserDocs,
+    productModuleNames, onAddProductModules, onRemoveProductModule,
   } = ctx;
+
+  const [productModuleInput, setProductModuleInput] = useState('');
+
+  const commitModuleNames = (raw) => {
+    const names = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (!names.length) return;
+    onAddProductModules?.(names);
+    setProductModuleInput('');
+  };
 
   return (
 
@@ -89,10 +99,61 @@ export const ArchLayersTab = React.memo(function ArchLayersTab(ctx) {
       </div>
     )}
   </div>
-  <div style={{fontSize:12, color:C.textSub, marginBottom:18, lineHeight:1.6}}>
+  <div style={{fontSize:12, color:C.textSub, marginBottom:14, lineHeight:1.6}}>
     7-layer enterprise Terraform architecture model. Detects layer completeness, factory components,
     Sentinel policies, IAM modules, and compliance alignment across your uploaded files.
   </div>
+
+  {/* ── Layer 6 Product Module Configuration ── */}
+  <div style={{
+    background:C.surface, border:`1px solid ${C.border}`, borderRadius:10,
+    padding:"14px 16px", marginBottom:16,
+  }}>
+    <div style={{...SANS, fontSize:12, fontWeight:700, color:C.textSub, marginBottom:6,
+      display:"flex", alignItems:"center", gap:6}}>
+      <Package size={13}/> Layer 6 — Product / Application Module Names
+    </div>
+    <div style={{fontSize:11, color:C.textMuted, marginBottom:10}}>
+      Enter your product module names to enable Layer 6 detection. Comma-separated or press Enter after each.
+      Example: <span style={{fontFamily:"monospace", fontSize:11}}>module-kinesis-analytics</span>
+    </div>
+    {(productModuleNames || []).length > 0 && (
+      <div style={{display:"flex", flexWrap:"wrap", gap:6, marginBottom:10}}>
+        {(productModuleNames || []).map((name, i) => (
+          <span key={i} style={{
+            display:"flex", alignItems:"center", gap:4, fontSize:11,
+            padding:"3px 8px", borderRadius:12,
+            background:"#7C4DFF20", border:"1px solid #7C4DFF44", color:"#9C6FFF",
+          }}>
+            {name}
+            <button onClick={() => onRemoveProductModule?.(i)} style={{
+              background:"none", border:"none", cursor:"pointer",
+              color:"#9C6FFF", padding:0, lineHeight:1, fontSize:13,
+            }}>×</button>
+          </span>
+        ))}
+      </div>
+    )}
+    <input
+      type="text"
+      placeholder="e.g. module-kinesis-analytics, module-rds-cluster"
+      value={productModuleInput}
+      onChange={e => setProductModuleInput(e.target.value)}
+      onKeyDown={e => {
+        if (e.key === 'Enter' || e.key === ',') {
+          e.preventDefault();
+          commitModuleNames(productModuleInput);
+        }
+      }}
+      onBlur={() => { if (productModuleInput.trim()) commitModuleNames(productModuleInput); }}
+      style={{
+        width:"100%", boxSizing:"border-box", padding:"7px 10px", fontSize:12,
+        borderRadius:6, border:`1px solid ${C.border2}`, background:C.bg,
+        color:C.text, outline:"none",
+      }}
+    />
+  </div>
+
   {!archLayerAnalysis ? (
     <div style={{color:C.textMuted, fontSize:13}}>Upload Terraform files to generate architecture layer analysis.</div>
   ) : (() => {

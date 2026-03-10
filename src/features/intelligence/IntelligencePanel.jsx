@@ -23,7 +23,8 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
   llmStatus, llmProgress, llmStatusText, embedStatus, embedProgress,
   selectedLlmModel, wllamaModelName, wllamaModelSize,
   onLoadModel, onHybridSearch, onGenerateLLM, vectorStore, computedIR,
-  archLayerAnalysis, archLayerVersion }) {
+  archLayerAnalysis, archLayerVersion,
+  productModuleNames, onAddProductModules, onRemoveProductModule }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null); // null = not searched yet
   const [iTab, setITab] = useState("assistant");
@@ -475,6 +476,9 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
             threatScenarios, setThreatScenarios, threatScenariosLoading, setThreatScenariosLoading,
             query, setQuery, results, setResults, queryLoading, setQueryLoading,
             noData, hasUserDocs,
+            productModuleNames: productModuleNames || [],
+            onAddProductModules,
+            onRemoveProductModule,
           };
           const tabNode = iTab==="assistant" ? <AIAssistantTab {...ctx} />
             : iTab==="threat-intel"     ? <ThreatIntelTab {...ctx} />

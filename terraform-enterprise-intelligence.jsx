@@ -355,6 +355,31 @@ export default function App() {
   const archLayerAnalysisRef = useRef(null);
   const [archLayerVersion, setArchLayerVersion] = useState(0);
 
+  // ── User-specified product module names for Layer 6 detection ────────────────
+  const [productModuleNames, setProductModuleNames] = useState(
+    () => {
+      try { return JSON.parse(localStorage.getItem('tf-product-modules') || '[]'); } catch { return []; }
+    }
+  );
+  const productModuleNamesRef = useRef(productModuleNames);
+  useEffect(() => {
+    productModuleNamesRef.current = productModuleNames;
+    // Persist across page reloads (model-agnostic; per-model persistence can be added later)
+    try { localStorage.setItem('tf-product-modules', JSON.stringify(productModuleNames)); } catch {}
+  }, [productModuleNames]);
+
+  const handleAddProductModules = useCallback((names) => {
+    setProductModuleNames(prev => {
+      const s = new Set(prev);
+      names.forEach(n => { if (n.trim()) s.add(n.trim()); });
+      return [...s];
+    });
+  }, []);
+
+  const handleRemoveProductModule = useCallback((idx) => {
+    setProductModuleNames(prev => prev.filter((_, i) => i !== idx));
+  }, []);
+
   // ── Threataform Assistant — wllama (local GGUF) + Custom RAG Engine ──────────
   // useLLM manages all LLM/embed state declarations; loadWllama stays in App
   const {
@@ -415,27 +440,31 @@ export default function App() {
   useEffect(() => { archOverridesRef.current = archOverrides; }, [archOverrides]);
   useEffect(() => { archLayerAnalysisRef.current = archLayerAnalysis; }, [archLayerAnalysis]);
 
-  // Run 7-layer enterprise architecture analysis whenever TF files or userDocs change.
-  // Combines files[] with any TF-extension files that ended up in userDocs so that
-  // ALL terraform-related files are analysed regardless of which upload path was used.
+  // Run 7-layer enterprise architecture analysis whenever TF files, userDocs, or
+  // user-specified product module names change.
+  // Combines files[] (all arch repo files incl. YAML/scripts) with any non-binary
+  // userDocs so ALL files are analysed regardless of upload path.
   useEffect(() => {
-    const TF_EXT = /\.(tf|hcl|sentinel|tfvars)$/i;
-    const userDocsTF = (userDocsRef.current || []).filter(d =>
-      d.content && d.path && TF_EXT.test(d.path)
+    // Include all non-binary userDocs (not just TF-ext) so YAML, JSON policy docs, etc.
+    // feed into the architecture analyzer (CRD detection, governance signals, etc.)
+    const userDocsExtra = (userDocsRef.current || []).filter(d =>
+      d.content && d.path && !d.binary
     );
     const existPaths = new Set(files.map(f => f.path));
-    const extraTF = userDocsTF.filter(d => !existPaths.has(d.path));
-    const allTF = extraTF.length ? [...files, ...extraTF] : files;
+    const extraFiles = userDocsExtra.filter(d => !existPaths.has(d.path));
+    const allFiles = extraFiles.length ? [...files, ...extraFiles] : files;
 
-    if (!allTF.length) { setArchLayerAnalysis(null); setArchLayerVersion(0); return; }
+    if (!allFiles.length) { setArchLayerAnalysis(null); setArchLayerVersion(0); return; }
     try {
-      const analysis = architectureAnalyzer.analyzeArchitecture(allTF);
+      const analysis = architectureAnalyzer.analyzeArchitecture(allFiles, {
+        userProductModules: productModuleNamesRef.current || [],
+      });
       setArchLayerAnalysis(analysis);
       setArchLayerVersion(v => v + 1);
     } catch (err) {
       console.warn('[ArchLayer] Analysis failed:', err);
     }
-  }, [files, userDocs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [files, userDocs, productModuleNames]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Stable refs so reparse ([] deps) and grade effect can always read current values
   const currentModelRef    = useRef(currentModel);
@@ -771,9 +800,12 @@ export default function App() {
       return;
     }
 
-    // ── Separate HCL/TF files from JSON/CFN files ─────────────────────────────
+    // ── Separate HCL/TF files from JSON/CFN files and other file types ───────
+    // Only explicit TF/HCL extensions go to the parser — YAML, Go, shell etc. stay
+    // in tfFiles for architecture analysis but must not enter the HCL parser.
     const CFN_SIG = /"AWSTemplateFormatVersion"|"Resources"\s*:\s*\{[\s\S]{1,500}"AWS::/;
-    const hclFiles = tfFiles.filter(f => !/\.json$/i.test(f.name));
+    const TF_PARSE_EXT = /\.(tf|hcl|tfvars|sentinel)$/i;
+    const hclFiles = tfFiles.filter(f => TF_PARSE_EXT.test(f.name));
     const jsonFiles = tfFiles.filter(f => /\.json$/i.test(f.name));
     const cfnFiles  = jsonFiles.filter(f =>
       /\.cfn\.json$/i.test(f.name) || CFN_SIG.test(f.content || '')
@@ -2592,6 +2624,9 @@ export default function App() {
           computedIR={computedIR}
           archLayerAnalysis={archLayerAnalysis}
           archLayerVersion={archLayerVersion}
+          productModuleNames={productModuleNames}
+          onAddProductModules={handleAddProductModules}
+          onRemoveProductModule={handleRemoveProductModule}
         />
       )}
 

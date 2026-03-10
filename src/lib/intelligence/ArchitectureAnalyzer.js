@@ -103,7 +103,10 @@ export class ArchitectureAnalyzer {
    * @param {Array<{path:string, name:string, content:string, size?:number}>} files
    * @returns {object} Full analysis result
    */
-  analyzeArchitecture(files = []) {
+  analyzeArchitecture(files = [], options = {}) {
+    // Accept user-specified product modules (Layer 6) from the UI
+    if (options.userProductModules?.length) this._productModules = options.userProductModules;
+
     const start = Date.now();
 
     // 1. Classify every file into an architectural category
@@ -126,14 +129,31 @@ export class ArchitectureAnalyzer {
 
     // 6. Product module auto-detection (Layer 6) + merge user selections
     const detectedProductModules = this.findPotentialProductModules(allFiles);
+    const userModuleAssessment = this._productModules.length > 0
+      ? this._assessUserProductModules(this._productModules, allFiles)
+      : null;
     const productModules = {
-      detected:   detectedProductModules,
-      userSelected: this._productModules,
+      detected:        detectedProductModules,
+      userSelected:    this._productModules,
+      userAssessment:  userModuleAssessment,
       allModules: [
         ...detectedProductModules,
-        ...this._productModules.filter(um => !detectedProductModules.some(d => d.name === um.name)),
+        ...this._productModules
+          .filter(um => !detectedProductModules.some(d => d.name === um))
+          .map(um => ({ name: um, userSpecified: true, found: userModuleAssessment?.found.includes(um) })),
       ],
     };
+    // If user specified L6 modules, update layer 6 completeness using their assessment
+    if (userModuleAssessment && layers[6]) {
+      const userScore = Math.round(userModuleAssessment.score * 100);
+      // Use the higher of auto-detected score and user-specified score
+      if (userScore > layers[6].completeness) {
+        layers[6].completeness = userScore;
+        layers[6].status = userScore >= 100 ? 'complete' : userScore > 0 ? 'partial' : 'missing';
+        layers[6].userModulesFound   = userModuleAssessment.found;
+        layers[6].userModulesMissing = userModuleAssessment.missing;
+      }
+    }
 
     // 7. Security control scores
     const security = this.analyzeSecurityControls(allFiles);
@@ -511,8 +531,10 @@ export class ArchitectureAnalyzer {
     patterns.push({ type: 'content', value: moduleLower });
     patterns.push({ type: 'content', value: module }); // original case for exact content match
 
-    // Abbreviation / alias patterns from the map
-    for (const alias of (ABBREVIATION_MAP[module] || [])) {
+    // Abbreviation / alias patterns from the map.
+    // Strip trailing '-*' or '_*' before looking up so 'platform-global-*' → 'platform-global'.
+    const mapKey = moduleLower.replace(/[-_]\*$/, '');
+    for (const alias of (ABBREVIATION_MAP[mapKey] || ABBREVIATION_MAP[module] || [])) {
       patterns.push({ type: 'alias', value: alias.toLowerCase() });
     }
 
@@ -562,12 +584,35 @@ export class ArchitectureAnalyzer {
           break;
         case 'alias':
         case 'signal':
-          if (nameLower.includes(p.value) || pathLower.includes(p.value) || contentLower.includes(p.value)) return true;
+          if (p.value.includes('*')) {
+            // Glob pattern — test against name and path segments
+            const re = this._globToRegex(p.value);
+            if (re.test(nameLower) || re.test(pathLower)) return true;
+          } else {
+            if (nameLower.includes(p.value) || pathLower.includes(p.value) || contentLower.includes(p.value)) return true;
+          }
           break;
         default:
           break;
       }
     }
+
+    // Content-based match for wildcard network/infrastructure modules (Bug C).
+    // Files inside network folders are named main.tf — detect by Terraform resource types in content.
+    if (module.includes('*')) {
+      const content = (file.content || '').toLowerCase();
+      const CONTENT_MAP = {
+        'vpc':              ['aws_vpc', 'resource "aws_vpc"', 'aws_subnet'],
+        'security-group':   ['aws_security_group'],
+        'transit-gateway':  ['aws_ec2_transit_gateway', 'aws_transit_gateway_attachment'],
+        'network-boundary': ['network_boundary', 'network-boundary', 'aws_vpc_peering_connection'],
+      };
+      const base = module.replace(/[-_]\*$/, '').replace(/\*/g, '').replace(/-+$/, '');
+      for (const [key, sigs] of Object.entries(CONTENT_MAP)) {
+        if (base === key && sigs.some(s => content.includes(s))) return true;
+      }
+    }
+
     return false;
   }
 
@@ -593,6 +638,46 @@ export class ArchitectureAnalyzer {
       .filter(s => s.score > 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
+  }
+
+  // ── Glob / signal matching helpers ───────────────────────────────────────────────────────────
+
+  /**
+   * Convert a glob pattern (containing * wildcards) into a case-insensitive RegExp.
+   * '*' matches any sequence of non-path-separator characters.
+   */
+  _globToRegex(pattern) {
+    // Escape all regex metacharacters except '*'
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    // Replace '*' with a regex that matches any non-separator characters
+    return new RegExp(escaped.replace(/\*/g, '[^/\\\\]*'), 'i');
+  }
+
+  /**
+   * Test whether `signal` matches anywhere in `text`.
+   * Signals containing '*' are treated as glob patterns; others use plain substring match.
+   */
+  _matchesSignal(signal, text) {
+    if (!signal.includes('*')) return text.includes(signal);
+    return this._globToRegex(signal).test(text);
+  }
+
+  /**
+   * Score Layer 6 against user-supplied product module names.
+   * A module is "found" if any file path/name contains it (dash/underscore-normalised).
+   */
+  _assessUserProductModules(userMods, files) {
+    const found   = [];
+    const missing = [];
+    for (const mod of userMods) {
+      const modKey = mod.toLowerCase().replace(/[-_]/g, '');
+      const hit = files.some(f => {
+        const combined = ((f.path || '') + '/' + (f.name || '')).toLowerCase().replace(/[-_]/g, '');
+        return combined.includes(modKey);
+      });
+      (hit ? found : missing).push(mod);
+    }
+    return { found, missing, score: found.length / Math.max(userMods.length, 1) };
   }
 
   // ── Factory analysis ──────────────────────────────────────────────────────────────────────────
@@ -625,7 +710,9 @@ export class ArchitectureAnalyzer {
         const contentLower = String(file.content || '').toLowerCase();
         const combined     = `${nameLower} ${pathLower}`;
 
-        const signalMatch = signals.some(s => combined.includes(s) || contentLower.includes(s));
+        const signalMatch = signals.some(s =>
+          this._matchesSignal(s, combined) || this._matchesSignal(s, contentLower)
+        );
         if (!signalMatch) continue;
 
         matchedFiles.push(file.name || file.path);
@@ -721,7 +808,9 @@ export class ArchitectureAnalyzer {
         const contentLower = String(file.content || '').toLowerCase();
         const combined     = `${nameLower} ${pathLower}`;
 
-        const signalMatch = signals.some(s => combined.includes(s) || contentLower.includes(s));
+        const signalMatch = signals.some(s =>
+          this._matchesSignal(s, combined) || this._matchesSignal(s, contentLower)
+        );
         if (!signalMatch) continue;
 
         matchedFiles.push(file.name || file.path);

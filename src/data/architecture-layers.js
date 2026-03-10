@@ -85,7 +85,12 @@ export const FACTORY_COMPONENTS = {
     apis: ['Organizations API', 'Control Tower API', 'Platform Services API'],
     dependencies: ['enterprise-aws-bootstrap'],
     security: ['RBAC', 'IRSA', 'SCP enforcement', 'OU-based boundaries'],
-    detectionSignals: ['portfolio-boundary', 'portfolio_boundary', 'PortfolioBoundary', 'pbf'],
+    detectionSignals: [
+      'portfolio-boundary', 'portfolio_boundary', 'PortfolioBoundary', 'pbf',
+      // Org-prefix-agnostic glob patterns (atlas-*, jpmc-*, xsphere-*, etc.):
+      '*-controller-portfolio*',
+      'portfolio-boundaries', 'portfolio_boundaries', 'controller-portfolio',
+    ],
   },
   'network-boundary-factory': {
     purpose: 'Provisions network boundaries — VPCs, TGW, PrivateLink, micro-segmentation',
@@ -95,7 +100,11 @@ export const FACTORY_COMPONENTS = {
     apis: ['EC2 Network API', 'TGW API', 'RAM API', 'Route 53 API'],
     dependencies: ['enterprise-aws-bootstrap', 'portfolio-boundary-factory'],
     security: ['RBAC', 'IRSA', 'default-deny SGs', 'VPC isolation', 'private subnets'],
-    detectionSignals: ['network-boundary', 'network_boundary', 'NetworkBoundary', 'nbf', 'netboundary'],
+    detectionSignals: [
+      'network-boundary', 'network_boundary', 'NetworkBoundary', 'nbf', 'netboundary',
+      '*-controller-network*',
+      'network-boundaries', 'network_boundaries', 'controller-network',
+    ],
   },
   'base-account-factory': {
     purpose: 'Vends new AWS accounts with baseline security config and governance controls',
@@ -105,7 +114,11 @@ export const FACTORY_COMPONENTS = {
     apis: ['Organizations API', 'Control Tower API', 'SSO API'],
     dependencies: ['enterprise-aws-bootstrap', 'portfolio-boundary-factory'],
     security: ['RBAC', 'IRSA', 'account-level SCPs', 'baseline IAM', 'CloudTrail by default'],
-    detectionSignals: ['base-account', 'base_account', 'BaselineAccount', 'baf', 'account-factory', 'account_factory'],
+    detectionSignals: [
+      'base-account', 'base_account', 'BaselineAccount', 'baf', 'account-factory', 'account_factory',
+      '*-controller-account*',
+      'controller-accounts', 'accounts-controller',
+    ],
   },
   'workload-boundary-factory': {
     purpose: 'Provisions workload-specific boundaries and isolation contexts for application teams',
@@ -115,7 +128,11 @@ export const FACTORY_COMPONENTS = {
     apis: ['Organizations API', 'IAM API', 'EKS API'],
     dependencies: ['enterprise-aws-bootstrap', 'portfolio-boundary-factory', 'network-boundary-factory'],
     security: ['RBAC', 'IRSA', 'workload namespace isolation', 'team-scoped SCPs'],
-    detectionSignals: ['workload-boundary', 'workload_boundary', 'WorkloadBoundary', 'wbf', 'workload-context'],
+    detectionSignals: [
+      'workload-boundary', 'workload_boundary', 'WorkloadBoundary', 'wbf', 'workload-context',
+      '*-controller-runtime*',
+      'workload-boundaries', 'workload_boundaries', 'controller-runtime',
+    ],
   },
 };
 
@@ -129,7 +146,10 @@ export const IAM_MODULES = {
     outputs: ['role_arn', 'role_name', 'instance_profile_arn'],
     crossAccount: true,
     security: ['Least Privilege', 'Trust Policies', 'Cross-Account Access', 'Permission Boundaries'],
-    detectionSignals: ['module-role', 'module_role', 'iam-role-module', 'role-module'],
+    detectionSignals: [
+      'module-role', 'module_role', 'iam-role-module', 'role-module',
+      '*-iam-role-*',
+    ],
   },
   'module-role-policy-updater': {
     purpose: 'Lifecycle management for IAM role policies — create, update, and retire policy attachments',
@@ -145,7 +165,10 @@ export const IAM_MODULES = {
     outputs: ['policy_arn', 'policy_id', 'policy_name'],
     crossAccount: false,
     security: ['Policy-as-Code', 'Version Control', 'Audit Trail'],
-    detectionSignals: ['module-iam-policy', 'iam_policy_module', 'iam-policy-module', 'module_iam_policy'],
+    detectionSignals: [
+      'module-iam-policy', 'iam_policy_module', 'iam-policy-module', 'module_iam_policy',
+      '*-iam-policy-*',
+    ],
   },
   'role-distribution-factory': {
     purpose: 'Distributes IAM roles across accounts and OUs at scale via factory pattern',
@@ -153,7 +176,10 @@ export const IAM_MODULES = {
     outputs: ['distributed_role_arns', 'distribution_report'],
     crossAccount: true,
     security: ['Centralized RBAC', 'Cross-Account Trust', 'Boundary Enforcement', 'Audit Trail'],
-    detectionSignals: ['role-distribution', 'role_distribution', 'roledist', 'rdf', 'iam-factory'],
+    detectionSignals: [
+      'role-distribution', 'role_distribution', 'roledist', 'rdf', 'iam-factory',
+      '*-managed-services-roles-controller',
+    ],
   },
 };
 
@@ -252,8 +278,17 @@ export const ABBREVIATION_MAP = {
   'module-role':                   ['iam-role', 'iam_role', 'role-module', 'iamrole'],
   'module-role-policy-updater':    ['role-policy-updater', 'policy-updater', 'role_policy_updater', 'rpu'],
   'module-iam-policy':             ['iam-policy', 'iam_policy', 'policy-module', 'iampolicy'],
-  'enterprise-aws-bootstrap':      ['bootstrap', 'aws-bootstrap', 'enterprise_bootstrap', 'xsphere-aws-bootstrap', 'xsphere_bootstrap'],
-  'sentinel-policies':             ['sentinel', 'policies', 'policy', 'governance', 'sentinel_policy'],
+  'enterprise-aws-bootstrap':      [
+    'bootstrap', 'aws-bootstrap', 'enterprise_bootstrap', 'xsphere-aws-bootstrap', 'xsphere_bootstrap',
+    // Literal aliases for common org-specific names:
+    'atlas2-runner', 'aws-core', 'runner-master', 'atlas2-runner-master', 'enterprise-bootstrap',
+    // Org-prefix-agnostic glob patterns:
+    '*-runner-*', '*-runner-master', '*-core-master', '*-onboarding-master', 'xsphere-*',
+  ],
+  'sentinel-policies':             [
+    'sentinel', 'policies', 'policy', 'governance', 'sentinel_policy',
+    '*-global-sentinel', '*-sentinel-*',
+  ],
   'platform-global':               ['platform', 'global', 'platform_global', 'atlas_global', 'atlas-global'],
   'aws-res-iam-role-policy':       ['aws-res', 'iam-role-policy', 'res-iam', 'awsres'],
   'module-msk-connect':            ['msk', 'kafka', 'messaging', 'mskconnect', 'msk_connect'],

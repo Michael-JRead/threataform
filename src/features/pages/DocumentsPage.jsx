@@ -146,11 +146,11 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
 
   // ── Read TF/HCL files as text in batches of 8 ───────────────────────────────
   const readTFFiles = async (fileList) => {
-    const TF_EXT   = /\.(tf|hcl|sentinel|tfvars)$/i;
-    const CFN_JSON = /\.cfn\.json$/i;
-    const SKIP     = /\.(ico|woff|woff2|ttf|eot|zip|tar|gz|7z|exe|dll|so|dylib|class|jar|war|pyc|lock)$/i;
+    // Accept all non-binary text files from the repo (TF, YAML, JSON, scripts, Go, etc.)
+    // so the architecture analyzer can detect CRDs, Jenkinsfiles, operator code, etc.
+    const SKIP = /\.(ico|png|jpg|jpeg|gif|webp|woff|woff2|ttf|eot|otf|zip|tar|gz|7z|bz2|xz|rar|exe|dll|so|dylib|class|jar|war|ear|pyc|pyo|bin|dat|sqlite|mp4|mp3|wav|avi|mov)$/i;
     const candidates = Array.from(fileList).filter(f =>
-      (TF_EXT.test(f.name) || CFN_JSON.test(f.name)) && !SKIP.test(f.name) && f.size < 512 * 1024 * 1024
+      !SKIP.test(f.name) && f.size < 512 * 1024 * 1024
     );
     if (!candidates.length) return;
     const BATCH = 8;
@@ -183,14 +183,14 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
   const handleTFDirectoryPicker = async () => {
     try {
       const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
-      const TF_EXT = /\.(tf|hcl|sentinel|tfvars)$/i;
+      const SKIP_DP = /\.(ico|png|jpg|jpeg|gif|webp|woff|woff2|ttf|eot|otf|zip|tar|gz|7z|bz2|xz|rar|exe|dll|so|dylib|class|jar|war|ear|pyc|pyo|bin|dat|sqlite|mp4|mp3|wav|avi|mov)$/i;
       const collected = [];
       const traverse = async (handle) => {
         for await (const [name, entry] of handle.entries()) {
           if (name.startsWith('.')) continue;
           if (entry.kind === 'file') {
             const file = await entry.getFile();
-            if (TF_EXT.test(name)) collected.push(file);
+            if (!SKIP_DP.test(name) && file.size < 512 * 1024 * 1024) collected.push(file);
           } else if (entry.kind === 'directory') {
             await traverse(entry);
           }
@@ -559,7 +559,7 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
                 >
                   <div style={{ fontSize:26, marginBottom:6, opacity: tfDragging ? 1 : 0.5 }}>🏗</div>
                   <div style={{...SANS, color:C.textMuted, fontSize:12, marginBottom:14}}>
-                    Drop .tf · .hcl · .sentinel · .tfvars · .cfn.json files or folders here — no size limit
+                    Drop any files from your repository folder here — .tf, .yaml, .json, scripts, Go, and more
                   </div>
                   <div style={{ display:"flex", gap:10, justifyContent:"center", flexWrap:"wrap" }}>
                     {'showDirectoryPicker' in window && (
@@ -585,7 +585,7 @@ function DocumentsPage({ model, modelDetails, userDocs, onSaveDetails, onAddDocs
                       fontSize:12, cursor:"pointer", ...SANS, display:"inline-flex", alignItems:"center", gap:6,
                     }}>
                       <Upload size={13}/> Browse Files
-                      <input type="file" multiple accept=".tf,.hcl,.sentinel,.tfvars,.json"
+                      <input type="file" multiple
                         onChange={e => { if (e.target.files?.length) readTFFiles(e.target.files); e.target.value=""; }}
                         style={{ display:"none" }} />
                     </label>
