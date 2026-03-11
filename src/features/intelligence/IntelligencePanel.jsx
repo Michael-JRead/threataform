@@ -1,16 +1,12 @@
 // src/features/intelligence/IntelligencePanel.jsx
-import React, { useState, useRef, useMemo, useEffect } from 'react';
-import { Upload, Building2, Search, ShieldCheck, GitCompare, ShieldAlert, Zap, TriangleAlert, ScanLine, Layers, Loader2, Shield, Cloud, FileText, CheckCircle2, AlertCircle, X, Info, Target, RotateCcw, Cpu, Server, Network, Users, Download, CheckCircle, Package, Bot, Send } from '../../icons.jsx';
+import React, { useMemo } from 'react';
+import { Upload, Building2, Search, ShieldCheck, GitCompare, ShieldAlert, Zap, TriangleAlert, ScanLine, Layers, Loader2, Shield, Cloud, FileText, CheckCircle2, AlertCircle, X, Info, Target, RotateCcw, Cpu, Server, Network, Users, Download, CheckCircle, Package } from '../../icons.jsx';
 import { MONO, SANS, C, SEV_COLOR, SEV_BG, card, sectionBar } from '../../constants/styles.js';
 import { ATTACK_TECHNIQUES, CWE_DETAILS } from '../../data/attack-data.js';
 import { CONTROL_DETECTION_MAP, DID_LAYERS, ZT_PILLARS } from '../../data/control-detection.js';
 import { generateTXTReport, generateMarkdownReport } from '../../lib/diagram/ExportUtils.js';
-import { mcpRegistry } from '../../lib/mcp/MCPToolRegistry.js';
-import { ARCH_QUICK_PROMPTS } from '../../lib/ThrataformRAG.js';
-import { wllamaManager } from '../../lib/WllamaManager.js';
+import { useIntelligenceState } from './useIntelligenceState.js';
 
-
-import { AIAssistantTab }     from './tabs/AIAssistantTab.jsx';
 import { ThreatIntelTab }     from './tabs/ThreatIntelTab.jsx';
 import { ScopeTab }           from './tabs/ScopeTab.jsx';
 import { MisconfigsTab }      from './tabs/MisconfigsTab.jsx';
@@ -25,73 +21,10 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
   onLoadModel, onHybridSearch, onGenerateLLM, vectorStore, computedIR,
   archLayerAnalysis, archLayerVersion,
   productModuleNames, onAddProductModules, onRemoveProductModule }) {
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState(null); // null = not searched yet
-  const [iTab, setITab] = useState("assistant");
-  const chatKey = currentModelId ? `tf-model-${currentModelId}-chat` : null;
-  const [chatMessages, setChatMessages] = useState(() => {
-    if (!chatKey) return [];
-    try { return JSON.parse(localStorage.getItem(chatKey) || "[]"); } catch { return []; }
-  });
-  const [chatInput, setChatInput] = useState("");
-  const [chatGenerating, setChatGenerating] = useState(false);
-  const [isTraining, setIsTraining]   = useState(false);  // LoRA fine-tuning state
-  const [ftProgress, setFtProgress]   = useState(0);       // LoRA training progress %
-  const [loraReady, setLoraReady]     = useState(false);   // LoRA adapter trained + ready to export
-  // MCP tool server state
-  const [mcpUrl, setMcpUrl]         = useState('ws://localhost:3747');
-  const [mcpStatus, setMcpStatus]   = useState(''); // '' | 'connected' | 'failed' | 'connecting'
-  const [mcpError, setMcpError]     = useState(null);
-  const [showMcpHelp, setShowMcpHelp] = useState(false);
-  const chatBottomRef = useRef(null);
-
-  // ── Cross-tab navigation state ──
-  const [attackFilter, setAttackFilter] = useState(null);
-  const [resourceSearch, setResourceSearch] = useState('');
-  const [resourceTypeFilter, setResourceTypeFilter] = useState('');
-  const [resourcePage, setResourcePage] = useState(0);
-  const [expandedControl, setExpandedControl] = useState(null);
-  const [expandedCwe, setExpandedCwe] = useState(null);
-  const [expandedFinding, setExpandedFinding] = useState(null);
-  // ── Per-tab async/LLM output state ──
-  const [synthesisingQuery, setSynthesisingQuery] = useState(false);
-  const [synthesisText, setSynthesisText] = useState('');
-  const [postureNarrative, setPostureNarrative] = useState('');
-  const [postureNarrLoading, setPostureNarrLoading] = useState(false);
-  const [gapAnalysis, setGapAnalysis] = useState('');
-  const [gapAnalysisLoading, setGapAnalysisLoading] = useState(false);
-  const [remediationPlan, setRemediationPlan] = useState('');
-  const [remediationLoading, setRemediationLoading] = useState(false);
-  const [threatScenarios, setThreatScenarios] = useState('');
-  const [threatScenariosLoading, setThreatScenariosLoading] = useState(false);
-  const [inferredScope, setInferredScope] = useState('');
-  const [inferredScopeLoading, setInferredScopeLoading] = useState(false);
-  const [resourceSummaries, setResourceSummaries] = useState({});
-  const [hybridHits, setHybridHits] = useState({});
-  const [techPassages, setTechPassages] = useState({});
-  const [findingGuidance, setFindingGuidance] = useState({});
-  const [attackNarrative, setAttackNarrative] = useState('');
-  const [attackNarrLoading, setAttackNarrLoading] = useState(false);
-  const [contradictionNarrative, setContradictionNarrative] = useState('');
-  const [contraNarrLoading, setContraNarrLoading] = useState(false);
-  const [queryLoading, setQueryLoading] = useState(false);
-  const [controlSearch, setControlSearch] = useState('');
-  // ── AI Assistant search mode (replaces Query Docs tab) ──
-  const [searchMode, setSearchMode] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState(null);
-  const [searchLoading, setSearchLoading] = useState(false);
-
-  // Persist chat history per model
-  useEffect(() => {
-    if (!chatKey) return;
-    try { localStorage.setItem(chatKey, JSON.stringify(chatMessages.filter(m => !m.streaming).slice(-60))); } catch {}
-  }, [chatMessages, chatKey]);
-
-  // Auto-scroll chat
-  useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior:"smooth" });
-  }, [chatMessages]);
+  // ── All panel state consolidated into a single useReducer ───────────────
+  // 46 useState declarations replaced by this hook. Chat/LoRA/MCP state removed
+  // (chat lives in AIChatPanel; LoRA + MCP live in SettingsPanel).
+  const { state, set } = useIntelligenceState();
 
   const summary = useMemo(() => {
     if (!intelligence?._built) return null;
@@ -99,16 +32,16 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
   }, [intelligence, intelligenceVersion, parseResult, userDocs]);
 
   const handleQuery = async () => {
-    if (!query.trim() || !intelligence) return;
-    setSynthesisText('');
-    setQueryLoading(true);
+    if (!state.query.trim() || !intelligence) return;
+    set('synthesisText')('');
+    set('queryLoading')(true);
     try {
-      const results = onHybridSearch
-        ? await onHybridSearch(query.trim(), 8)
-        : intelligence.query(query.trim(), 8);
-      setResults(results);
+      const queryResults = onHybridSearch
+        ? await onHybridSearch(state.query.trim(), 8)
+        : intelligence.query(state.query.trim(), 8);
+      set('results')(queryResults);
     } finally {
-      setQueryLoading(false);
+      set('queryLoading')(false);
     }
   };
 
@@ -207,11 +140,10 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
     return (
       <div style={{padding:"48px 40px", maxWidth:720, textAlign:"center"}}>
         <div style={{fontSize:48, marginBottom:16, opacity:0.4}}>🧠</div>
-        <div style={{fontSize:18, fontWeight:600, color:C.text, marginBottom:8}}>Intelligence Engine</div>
+        <div style={{fontSize:18, fontWeight:600, color:C.text, marginBottom:8}}>Intelligence index not ready</div>
         <div style={{fontSize:13, color:C.textSub, lineHeight:1.7, maxWidth:480, margin:"0 auto"}}>
-          Upload architecture documents, runbooks, threat models, or compliance docs.
-          The intelligence engine will index them and let you query your architecture knowledge
-          base with zero hallucination — every answer is a verbatim passage from your documents.
+          Complete Setup — upload Terraform files and supporting documents — then return here.
+          The intelligence engine will index everything and surface posture, scope, and resource findings.
         </div>
         <div style={{marginTop:24, padding:"16px 20px", background:C.surface,
           border:`1px solid ${C.border}`, borderRadius:10, maxWidth:480, margin:"24px auto 0",
@@ -232,10 +164,9 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
 
   const SEV_COLOR = { Critical:"#B71C1C", High:"#E53935", Medium:"#F57C00", Low:"#43A047" };
 
+  // "assistant" tab removed — AI chat is now the persistent right panel (AIChatPanel).
+  // 7 tabs remain across 3 groups.
   const ITAB_GROUPS = [
-    { label: "Assistant", tabs: [
-      {id:"assistant",        label:"AI Assistant",                 Icon: Bot,          accent:"#7C3AED"},
-    ]},
     { label: "Analysis", tabs: [
       {id:"posture-controls", label:"Security Posture & Controls",  Icon: ShieldCheck},
       {id:"misconfigs",       label:"Misconfig Checks",             Icon: ShieldAlert},
@@ -250,11 +181,6 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
       {id:"arclayers",        label:"Architecture Layers",          Icon: Building2,    accent:"#0277BD"},
     ]},
   ];
-  const ITABS = ITAB_GROUPS.flatMap(g => g.tabs);
-
-  const llmStatusDot = llmStatus === "ready" ? "#43A047"
-    : llmStatus === "loading" ? "#F57C00"
-    : llmStatus === "error" ? "#E53935" : "#555";
 
   // ── Shared markdown renderer (used by all tabs) ──────────────────────────
   const inlineFormat = (text, key = 0) => {
@@ -376,22 +302,22 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
             <div style={{fontSize:9, color:C.textMuted, fontWeight:700, textTransform:"uppercase",
               letterSpacing:".12em", padding:"4px 10px 4px", opacity:0.7}}>{group.label}</div>
             {group.tabs.map(tab => {
-              const isAssistant = tab.id === "assistant";
               const accentColor = tab.accent || C.accent;
-              const isActive = iTab === tab.id;
+              const isActive = state.iTab === tab.id;
               return (
-                <button key={tab.id} onClick={()=>setITab(tab.id)} style={{
-                  display:"flex", alignItems:"center", gap:8, width:"100%", textAlign:"left",
-                  padding:"7px 10px",
-                  background: isActive ? `${accentColor}20` : isAssistant ? `${accentColor}06` : "transparent",
-                  border: isAssistant ? `1px solid ${accentColor}${isActive?"55":"22"}` : "none",
-                  borderRadius:7, color: isActive ? accentColor : C.textSub,
-                  fontSize:12, cursor:"pointer", ...SANS, fontWeight: isActive ? 600 : 400,
-                  marginBottom:1,
-                }}>
+                <button key={tab.id} onClick={() => set('iTab')(tab.id)}
+                  role="tab" aria-selected={isActive}
+                  style={{
+                    display:"flex", alignItems:"center", gap:8, width:"100%", textAlign:"left",
+                    padding:"7px 10px",
+                    background: isActive ? `${accentColor}20` : "transparent",
+                    border: "none",
+                    borderRadius:7, color: isActive ? accentColor : C.textSub,
+                    fontSize:12, cursor:"pointer", ...SANS, fontWeight: isActive ? 600 : 400,
+                    marginBottom:1,
+                  }}>
                   <tab.Icon size={13} />
                   <span style={{flex:1}}>{tab.label}</span>
-                  {isAssistant && <span style={{width:6, height:6, borderRadius:"50%", background:llmStatusDot, flexShrink:0}} />}
                 </button>
               );
             })}
@@ -442,53 +368,62 @@ function IntelligencePanel({ intelligence, intelligenceVersion, userDocs, parseR
       {/* Content */}
       <div style={{flex:1, overflowY:"auto", padding:"24px 28px"}}>
 
-        {/* ── AI ASSISTANT TAB ── */}
-
-        {/* Tab routing - each tab is a separate component */}
+        {/* Tab routing — each iTab value renders a separate component */}
         {(() => {
+          // Alias for readable ctx construction
+          const s = state;
           const ctx = {
+            // ── Passthrough props ──────────────────────────────────────────
             summary, parseResult, userDocs, llmStatus, onGenerateLLM, onHybridSearch,
             intelligence, computedIR, archLayerAnalysis,
             modelDetails, archAnalysis, archOverrides, selectedLlmModel,
-            embedStatus, embedProgress,
-            attackFilter, setAttackFilter, expandedCwe, setExpandedCwe,
-            expandedFinding, setExpandedFinding, expandedControl, setExpandedControl,
-            techPassages, setTechPassages, findingGuidance, setFindingGuidance,
-            attackNarrative, setAttackNarrative, attackNarrLoading, setAttackNarrLoading,
-            contradictionNarrative, setContradictionNarrative, contraNarrLoading, setContraNarrLoading,
-            postureNarrative, setPostureNarrative, postureNarrLoading, setPostureNarrLoading,
-            gapAnalysis, setGapAnalysis, gapAnalysisLoading, setGapAnalysisLoading,
-            remediationPlan, setRemediationPlan, remediationLoading, setRemediationLoading,
-            inferredScope, setInferredScope, inferredScopeLoading, setInferredScopeLoading,
-            resourceSummaries, setResourceSummaries, hybridHits, setHybridHits,
-            resourceSearch, setResourceSearch, resourceTypeFilter, setResourceTypeFilter,
-            resourcePage, setResourcePage, controlSearch, setControlSearch,
-            chatMessages, setChatMessages, chatInput, setChatInput,
-            chatGenerating, setChatGenerating, chatBottomRef,
-            isTraining, setIsTraining, ftProgress, setFtProgress, loraReady, setLoraReady,
-            mcpUrl, setMcpUrl, mcpStatus, setMcpStatus, mcpError, setMcpError,
-            showMcpHelp, setShowMcpHelp,
-            llmProgress, llmStatusText, wllamaModelName, wllamaModelSize,
-            onLoadModel, vectorStore,
-            searchMode, setSearchMode, searchQuery, setSearchQuery,
-            searchResults, setSearchResults, searchLoading, setSearchLoading,
-            synthesisingQuery, setSynthesisingQuery, synthesisText, setSynthesisText,
-            threatScenarios, setThreatScenarios, threatScenariosLoading, setThreatScenariosLoading,
-            query, setQuery, results, setResults, queryLoading, setQueryLoading,
+            embedStatus, embedProgress, vectorStore,
             noData, hasUserDocs,
             productModuleNames: productModuleNames || [],
             onAddProductModules,
             onRemoveProductModule,
+            // ── State from useIntelligenceState ───────────────────────────
+            attackFilter: s.attackFilter,               setAttackFilter: set('attackFilter'),
+            expandedCwe: s.expandedCwe,                 setExpandedCwe: set('expandedCwe'),
+            expandedFinding: s.expandedFinding,         setExpandedFinding: set('expandedFinding'),
+            expandedControl: s.expandedControl,         setExpandedControl: set('expandedControl'),
+            techPassages: s.techPassages,               setTechPassages: set('techPassages'),
+            findingGuidance: s.findingGuidance,         setFindingGuidance: set('findingGuidance'),
+            attackNarrative: s.attackNarrative,         setAttackNarrative: set('attackNarrative'),
+            attackNarrLoading: s.attackNarrLoading,     setAttackNarrLoading: set('attackNarrLoading'),
+            contradictionNarrative: s.contradictionNarrative, setContradictionNarrative: set('contradictionNarrative'),
+            contraNarrLoading: s.contraNarrLoading,     setContraNarrLoading: set('contraNarrLoading'),
+            postureNarrative: s.postureNarrative,       setPostureNarrative: set('postureNarrative'),
+            postureNarrLoading: s.postureNarrLoading,   setPostureNarrLoading: set('postureNarrLoading'),
+            gapAnalysis: s.gapAnalysis,                 setGapAnalysis: set('gapAnalysis'),
+            gapAnalysisLoading: s.gapAnalysisLoading,   setGapAnalysisLoading: set('gapAnalysisLoading'),
+            remediationPlan: s.remediationPlan,         setRemediationPlan: set('remediationPlan'),
+            remediationLoading: s.remediationLoading,   setRemediationLoading: set('remediationLoading'),
+            inferredScope: s.inferredScope,             setInferredScope: set('inferredScope'),
+            inferredScopeLoading: s.inferredScopeLoading, setInferredScopeLoading: set('inferredScopeLoading'),
+            resourceSummaries: s.resourceSummaries,     setResourceSummaries: set('resourceSummaries'),
+            hybridHits: s.hybridHits,                   setHybridHits: set('hybridHits'),
+            resourceSearch: s.resourceSearch,           setResourceSearch: set('resourceSearch'),
+            resourceTypeFilter: s.resourceTypeFilter,   setResourceTypeFilter: set('resourceTypeFilter'),
+            resourcePage: s.resourcePage,               setResourcePage: set('resourcePage'),
+            controlSearch: s.controlSearch,             setControlSearch: set('controlSearch'),
+            synthesisingQuery: s.synthesisingQuery,     setSynthesisingQuery: set('synthesisingQuery'),
+            synthesisText: s.synthesisText,             setSynthesisText: set('synthesisText'),
+            threatScenarios: s.threatScenarios,         setThreatScenarios: set('threatScenarios'),
+            threatScenariosLoading: s.threatScenariosLoading, setThreatScenariosLoading: set('threatScenariosLoading'),
+            query: s.query,                             setQuery: set('query'),
+            results: s.results,                         setResults: set('results'),
+            queryLoading: s.queryLoading,               setQueryLoading: set('queryLoading'),
           };
-          const tabNode = iTab==="assistant" ? <AIAssistantTab {...ctx} />
-            : iTab==="threat-intel"     ? <ThreatIntelTab {...ctx} />
+          const iTab = state.iTab;
+          const tabNode = iTab==="threat-intel"     ? <ThreatIntelTab {...ctx} />
             : iTab==="scope"            ? <ScopeTab {...ctx} />
             : iTab==="misconfigs"       ? <MisconfigsTab {...ctx} />
             : iTab==="posture-controls" ? <PostureControlsTab {...ctx} />
             : iTab==="crossdoc"         ? <CrossDocTab {...ctx} />
             : iTab==="resources"        ? <ResourceIntelTab {...ctx} />
             : iTab==="arclayers"        ? <ArchLayersTab {...ctx} />
-            : null;
+            : <PostureControlsTab {...ctx} />;   // fallback
           return tabNode;
         })()}
       </div>

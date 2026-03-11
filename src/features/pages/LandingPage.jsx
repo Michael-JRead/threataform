@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { Shield, Brain, Target, X } from '../../icons.jsx';
+import { Shield, X } from '../../icons.jsx';
 import { C, SANS } from '../../constants/styles.js';
+import { GradeBadge } from '../../components/GradeBadge.jsx';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LANDING PAGE — Threat model selection / creation
@@ -15,7 +16,6 @@ function LandingPage({ onCreateModel, onOpenModel, onDeleteModel, threatModels }
     onCreateModel(n);
   };
 
-  const GRADE_COLORS = { A:"#43A047", B:"#7CB342", C:"#F57C00", D:"#E64A19", F:"#B71C1C" };
 
   return (
     <div style={{...SANS, minHeight:"100vh", background:C.bg, display:"flex", flexDirection:"column", alignItems:"center", padding:"72px 24px 60px"}}>
@@ -112,13 +112,9 @@ function LandingPage({ onCreateModel, onOpenModel, onDeleteModel, threatModels }
               >
                 {/* Grade badge */}
                 {model.grade && (
-                  <div style={{
-                    position:"absolute", top:14, right:40,
-                    fontSize:13, fontWeight:800, color:GRADE_COLORS[model.grade]||C.accent,
-                    background:`${GRADE_COLORS[model.grade]||C.accent}18`,
-                    border:`1px solid ${GRADE_COLORS[model.grade]||C.accent}40`,
-                    borderRadius:6, padding:"2px 8px",
-                  }}>{model.grade}</div>
+                  <div style={{ position:"absolute", top:12, right:38 }}>
+                    <GradeBadge grade={model.grade} size="sm" />
+                  </div>
                 )}
                 {/* Delete */}
                 <button onClick={e=>{e.stopPropagation();onDeleteModel(model.id);}} style={{

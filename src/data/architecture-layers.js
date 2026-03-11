@@ -87,7 +87,6 @@ export const FACTORY_COMPONENTS = {
     security: ['RBAC', 'IRSA', 'SCP enforcement', 'OU-based boundaries'],
     detectionSignals: [
       'portfolio-boundary', 'portfolio_boundary', 'PortfolioBoundary', 'pbf',
-      // Org-prefix-agnostic glob patterns (atlas-*, jpmc-*, xsphere-*, etc.):
       '*-controller-portfolio*',
       'portfolio-boundaries', 'portfolio_boundaries', 'controller-portfolio',
     ],

@@ -50,6 +50,10 @@ import UserDocsPanel from './src/components/UserDocsPanel.jsx';
 import DocumentsPage from './src/features/pages/DocumentsPage.jsx';
 import AnalysisPanel from './src/features/analysis/AnalysisPanel.jsx';
 import IntelligencePanel from './src/features/intelligence/IntelligencePanel.jsx';
+import { WorkspaceShell } from './src/features/workspace/WorkspaceShell.jsx';
+import { AIChatPanel } from './src/features/intelligence/AIChatPanel.jsx';
+import { SetupPanel } from './src/features/setup/SetupPanel.jsx';
+import { SettingsPanel } from './src/features/settings/SettingsPanel.jsx';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ENTERPRISE TERRAFORM ARCHITECTURE INTELLIGENCE PLATFORM  v1.0
@@ -237,8 +241,20 @@ import {
 // MAIN APP
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [mainTab, setMainTab] = useState("knowledge");
+  const [mainTab, setMainTab] = useState("build");
   const [kbDomain, setKbDomain] = useState("xsphere");
+  // ── Workspace layout state ───────────────────────────────────────────────────
+  // navSection controls the NavRail (left icon nav) in the workspace.
+  // 'overview'|'setup'|'diagram'|'threats'|'intelligence'|'settings'
+  const [navSection, setNavSection] = useState("setup");
+  const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  // Sync navSection → mainTab so tab rendering conditions (mainTab==="xxx") keep working.
+  // Effect runs after navSection changes (caused by NavRail or any setNavSection call).
+  // "setup" and "settings" map to "build" to ensure their legacy sibling blocks stay hidden
+  // (each is gated additionally by navSection !== "setup" / navSection !== "settings").
+  const _NAV_TO_TAB = { overview:"knowledge", setup:"build", diagram:"dfd", threats:"analysis", intelligence:"intelligence", settings:"build" };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (_NAV_TO_TAB[navSection]) setMainTab(_NAV_TO_TAB[navSection]); }, [navSection]);
   // ── Parse Result State — useParseResult ─────────────────────────────────────
   const { files, setFiles, parseResult, setParseResult, xml, setXml } = useParseResult();
   const [dfdTab, setDfdTab] = useState("stats");
@@ -286,16 +302,22 @@ export default function App() {
   const createModel = useCallback((name) => {
     const model = _createModel(name);
     setDiagramImage(null); setArchAnalysis(null); setArchOverrides({});
-    setAppMode("documents"); setMainTab("build");
+    setAppMode("documents"); setMainTab("build"); setNavSection("setup");
     setFiles([]); setParseResult(null); setXml(""); setScopeFiles(null); setError("");
     setUserDocsState([]); // useUserDocs will load from IDB via its own effect
+    setProductModuleNames([]);
   }, [_createModel, setUserDocsState]); // eslint-disable-line
 
   const openModel = useCallback((model) => {
     _openModel(model); // loads modelDetails from IDB asynchronously
-    setAppMode("documents"); setMainTab("build");
+    setAppMode("documents"); setMainTab("build"); setNavSection("setup");
     setFiles([]); setParseResult(null); setXml(""); setScopeFiles(null); setError("");
     setDiagramImage(null); setArchAnalysis(null); setArchOverrides({});
+    // Load product module names per-model
+    try {
+      const saved = JSON.parse(localStorage.getItem(`tf-model-${model.id}-product-modules`) || '[]');
+      setProductModuleNames(Array.isArray(saved) ? saved : []);
+    } catch { setProductModuleNames([]); }
     // useUserDocs loads docs from IDB via its own effect on currentModel change
 
     // Load TF files from IDB (async)
@@ -356,17 +378,14 @@ export default function App() {
   const [archLayerVersion, setArchLayerVersion] = useState(0);
 
   // ── User-specified product module names for Layer 6 detection ────────────────
-  const [productModuleNames, setProductModuleNames] = useState(
-    () => {
-      try { return JSON.parse(localStorage.getItem('tf-product-modules') || '[]'); } catch { return []; }
-    }
-  );
-  const productModuleNamesRef = useRef(productModuleNames);
+  // Per-model: saved to localStorage under tf-model-{id}-product-modules
+  const [productModuleNames, setProductModuleNames] = useState([]);
+  const productModuleNamesRef = useRef([]);
   useEffect(() => {
     productModuleNamesRef.current = productModuleNames;
-    // Persist across page reloads (model-agnostic; per-model persistence can be added later)
-    try { localStorage.setItem('tf-product-modules', JSON.stringify(productModuleNames)); } catch {}
-  }, [productModuleNames]);
+    if (!currentModel?.id) return;
+    try { localStorage.setItem(`tf-model-${currentModel.id}-product-modules`, JSON.stringify(productModuleNames)); } catch {}
+  }, [productModuleNames, currentModel?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleAddProductModules = useCallback((names) => {
     setProductModuleNames(prev => {
@@ -1161,7 +1180,7 @@ export default function App() {
           onRemoveDoc={removeUserDoc}
           onContinue={(tfReadFiles) => {
             setAppMode("workspace");
-            setMainTab("build");
+            setMainTab("build"); setNavSection("setup");
             if (tfReadFiles?.length) {
               // MERGE with existing files (IDB-loaded or prior Build-tab uploads)
               // so that architecture analysis sees ALL TF files from all sources.
@@ -1185,16 +1204,67 @@ export default function App() {
     );
   }
 
+  // ── Workspace nav items (used by NavRail in WorkspaceShell) ─────────────────
+  const _navItems = [
+    { id:"overview",     icon:<Home size={17}/>,        label:"Overview",     title:"Model summary, health grade, and recent findings" },
+    { id:"setup",        icon:<Upload size={17}/>,      label:"Setup",        title:"Upload files and configure application details" },
+    { id:"diagram",      icon:<Layers size={17}/>,      label:"Diagram",      title:"Data flow diagram and export" },
+    { id:"threats",      icon:<ShieldAlert size={17}/>, label:"Threats",      title:"STRIDE, ATT&CK, and misconfigurations" },
+    { id:"intelligence", icon:<Brain size={17}/>,       label:"Intelligence", title:"Posture, scope, resource, and architecture analysis" },
+    { id:"settings",     icon:<Settings size={17}/>,    label:"Settings",     title:"LLM model, MCP server, and model settings" },
+  ];
+  // ── Export buttons (passed as headerRight to WorkspaceShell) ─────────────────
+  const _exportBtns = xml ? (
+    <div style={{display:"flex", gap:8, alignItems:"center"}}>
+      <button onClick={download} aria-label="Export diagram as XML" style={{background:"linear-gradient(135deg,#FF6B3520,#FF990020)",border:`1px solid ${C.accent}55`,borderRadius:7,padding:"7px 18px",color:C.accent,fontSize:12,cursor:"pointer",...SANS,display:"flex",alignItems:"center",gap:6,fontWeight:700}}><Download size={13}/> Export .xml</button>
+      <button onClick={copy} aria-label="Copy XML to clipboard" style={{background:copied?"#0D2010":C.surface2,border:`1px solid ${copied?C.green+"66":C.border2}`,borderRadius:7,padding:"7px 13px",color:copied?C.green:C.textMuted,fontSize:12,cursor:"pointer",...SANS,display:"flex",alignItems:"center",gap:5,transition:"all .15s"}}>{copied?<CheckCircle2 size={13}/>:<CheckSquare size={13} style={{opacity:0.6}}/>} {copied?"Copied!":"Copy XML"}</button>
+      <button onClick={downloadLucid} aria-label="Download Lucid import file" title="Lucid Standard Import (.lucid)" style={{background:C.surface2,border:`1px solid ${C.border2}`,borderRadius:7,padding:"7px 13px",color:C.textMuted,fontSize:12,cursor:"pointer",...SANS,display:"flex",alignItems:"center",gap:5}}><Download size={13}/> .lucid</button>
+      {archLayerAnalysis && (<><button onClick={()=>{try{const txt=generateTXTReport(archLayerAnalysis,{grade:intelligenceRef.current?.getSecurityPosture?.(parseResult?.resources||[])?.grade});const blob=new Blob([txt],{type:"text/plain"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="architecture-report.txt";a.click();URL.revokeObjectURL(a.href);}catch(e){console.error("[ExportTXT]",e);}}} aria-label="Export architecture report as TXT" style={{background:C.surface2,border:`1px solid ${C.border2}`,borderRadius:7,padding:"7px 13px",color:C.textMuted,fontSize:12,cursor:"pointer",...SANS,display:"flex",alignItems:"center",gap:5}}><FileText size={13}/> Report .txt</button><button onClick={()=>{try{const md=generateMarkdownReport(archLayerAnalysis,{grade:intelligenceRef.current?.getSecurityPosture?.(parseResult?.resources||[])?.grade});const blob=new Blob([md],{type:"text/markdown"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="architecture-report.md";a.click();URL.revokeObjectURL(a.href);}catch(e){console.error("[ExportMD]",e);}}} aria-label="Export architecture report as Markdown" style={{background:C.surface2,border:`1px solid ${C.border2}`,borderRadius:7,padding:"7px 13px",color:C.textMuted,fontSize:12,cursor:"pointer",...SANS,display:"flex",alignItems:"center",gap:5}}><Download size={13}/> Report .md</button></>)}
+    </div>
+  ) : null;
+
+  // ── AI Chat right panel ────────────────────────────────────────────────────
+  const _aiPanel = currentModel ? (
+    <AIChatPanel
+      intelligence={intelligenceRef.current}
+      llmStatus={llmStatus}
+      llmProgress={llmProgress}
+      llmStatusText={llmStatusText}
+      selectedLlmModel={selectedLlmModel}
+      wllamaModelName={wllamaModelName}
+      onHybridSearch={hybridSearch}
+      onGenerateLLM={generateLLMResponse}
+      parseResult={parseResult}
+      userDocs={userDocs}
+      modelDetails={modelDetails}
+      archLayerAnalysis={archLayerAnalysis}
+      archAnalysis={archAnalysis}
+      archOverrides={archOverrides}
+      currentModelId={currentModel?.id}
+      onOpenSettings={() => setNavSection("settings")}
+    />
+  ) : null;
+
   return (
-    <div style={{...SANS, background:C.bg, minHeight:"100vh", color:C.text}}>
+    <WorkspaceShell
+      navSection={navSection}
+      setNavSection={setNavSection}
+      navItems={_navItems}
+      rightPanel={_aiPanel}
+      rightPanelOpen={rightPanelOpen}
+      setRightPanelOpen={setRightPanelOpen}
+      currentModel={currentModel}
+      grade={currentModel?.gradeColor ? "?" : undefined}
+      gradeColor={currentModel?.gradeColor}
+      onHome={() => setAppMode("landing")}
+      headerRight={_exportBtns}
+      rebuildActive={!!(ingestState && ingestState.done < ingestState.total)}
+      rebuildStatusText={ingestState ? `Ingesting (${ingestState.done}/${ingestState.total})` : "Processing…"}
+    >
       <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
 
-      {/* ── HEADER ── */}
-      <div style={{
-        background:C.surface, borderBottom:`1px solid ${C.border}`,
-        padding:"0 16px", display:"flex", alignItems:"center", height:58,
-        position:"sticky", top:0, zIndex:100,
-      }}>
+      {/* ── HEADER (hidden — WorkspaceShell provides the new header) ── */}
+      <div style={{display:"none"}}>
         {/* Back to landing + brand */}
         <div style={{display:"flex", alignItems:"center", gap:10, marginRight:20, flexShrink:0}}>
           <button onClick={()=>setAppMode("landing")} title="All threat models" style={{
@@ -1232,11 +1302,11 @@ export default function App() {
             return false;
           };
           const steps = [
-            { num:1, label:"Know Your Domain", tab:"knowledge" },
-            { num:2, label:"Build Model",       tab:"build" },
-            { num:3, label:"Analyze Threats",   tab:"analysis" },
-            { num:4, label:"Review Intelligence", tab:"intelligence" },
-            { num:5, label:"Export",            tab:"dfd" },
+            { num:1, label:"Overview",      tab:"knowledge" },
+            { num:2, label:"Setup",         tab:"build" },
+            { num:3, label:"Threats",       tab:"analysis" },
+            { num:4, label:"Intelligence",  tab:"intelligence" },
+            { num:5, label:"Diagram",       tab:"dfd" },
           ];
           return (
             <div style={{ display:"flex", alignItems:"center", gap:0, padding:"0 24px" }}>
@@ -1359,7 +1429,7 @@ export default function App() {
 
       {/* ── KNOWLEDGE BASE TAB ── */}
       {mainTab==="knowledge" && (
-        <div style={{display:"grid", gridTemplateColumns:"256px 1fr", height:"calc(100vh - 58px)"}}>
+        <div style={{display:"grid", gridTemplateColumns:"256px 1fr", height:"100%"}}>
           {/* Sidebar */}
           <div style={{
             background:C.surface, borderRight:`1px solid ${C.border}`,
@@ -1418,7 +1488,7 @@ export default function App() {
                 Quick Tips
               </div>
               {[
-                "Upload .tf files to auto-generate DFD",
+                "Drop .tf files in Setup to auto-generate DFD",
                 "Cross-file references detected",
                 "Module trees visualized",
                 "Sentinel policy gates shown",
@@ -1557,7 +1627,7 @@ export default function App() {
         };
 
         return (
-          <div style={{ height:"calc(100vh - 58px)", overflow:"hidden", display:"flex", flexDirection:"column" }}>
+          <div style={{ height:"100%", overflow:"hidden", display:"flex", flexDirection:"column" }}>
             {/* Header bar */}
             <div style={{ padding:"16px 28px", borderBottom:`1px solid ${C.border}`, background:C.surface,
               display:"flex", alignItems:"center", gap:16, flexShrink:0 }}>
@@ -1585,11 +1655,11 @@ export default function App() {
             {!archAnalysis && !archAnalyzing ? (
               <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:12 }}>
                 <Building2 size={40} style={{color:C.textMuted, opacity:.4}}/>
-                <div style={{...SANS, fontSize:14, color:C.textMuted}}>Upload Terraform files or documents to generate architecture analysis</div>
-                <button onClick={()=>setMainTab("build")} style={{
+                <div style={{...SANS, fontSize:14, color:C.textMuted}}>Upload Terraform files or documents in Setup to generate architecture analysis</div>
+                <button onClick={()=>setNavSection("setup")} style={{
                   ...SANS, fontSize:12, padding:"7px 16px", borderRadius:7,
                   background:`${C.accent}18`, border:`1px solid ${C.accent}44`, color:C.accent, cursor:"pointer",
-                }}>Go to Upload & Analyze</button>
+                }}>Go to Setup</button>
               </div>
             ) : (() => {
               // ── Inline markdown renderer for narrative preview ──
@@ -1855,13 +1925,63 @@ export default function App() {
       })()}
 
 
-      {/* ── BUILD MODEL TAB (merged: Upload + Architecture) ── */}
-      {mainTab==="build" && (
-        <div style={{padding:"32px 40px", maxWidth:980, height:"calc(100vh - 58px)", overflowY:"auto"}}>
+      {/* ── SETUP PANEL (navSection="setup") ── */}
+      {navSection === "setup" && (
+        <SetupPanel
+          files={files}
+          parseResult={parseResult}
+          ingestState={ingestState}
+          error={error}
+          handleDrop={handleDrop}
+          readFiles={readFiles}
+          readDirectory={readDirectory}
+          removeFile={removeFile}
+          clearFiles={clearFiles}
+          currentModel={currentModel}
+          modelDetails={modelDetails}
+          saveModelDetails={saveModelDetails}
+          archAnalysis={archAnalysis}
+          archOverrides={archOverrides}
+          archAnalyzing={archAnalyzing}
+          setArchOverrides={setArchOverrides}
+          setArchAnalyzing={setArchAnalyzing}
+          setIntelligenceVersion={setIntelligenceVersion}
+          modelMetaPut={modelMetaPut}
+          intelligence={intelligenceRef.current}
+          intelligenceVersion={intelligenceVersion}
+          userDocs={userDocs}
+          productModuleNames={productModuleNames}
+          onAddProductModules={handleAddProductModules}
+          onRemoveProductModule={handleRemoveProductModule}
+          onNavToThreats={() => setNavSection("threats")}
+          onNavToDiagram={() => setNavSection("diagram")}
+        />
+      )}
+
+      {/* ── SETTINGS PANEL (navSection="settings") ── */}
+      {navSection === "settings" && (
+        <SettingsPanel
+          llmStatus={llmStatus}
+          llmProgress={llmProgress}
+          llmStatusText={llmStatusText}
+          selectedLlmModel={selectedLlmModel}
+          wllamaModelName={wllamaModelName}
+          wllamaModelSize={wllamaModelSize}
+          onLoadModel={loadWllama}
+          userDocs={userDocs}
+          currentModel={currentModel}
+          modelDetails={modelDetails}
+          saveModelDetails={saveModelDetails}
+        />
+      )}
+
+      {/* ── BUILD MODEL TAB (merged: Upload + Architecture) — legacy, hidden when navSection=setup/settings ── */}
+      {mainTab==="build" && navSection !== "setup" && navSection !== "settings" && (
+        <div style={{padding:"32px 40px", maxWidth:980, height:"100%", overflowY:"auto"}}>
           {/* Page heading */}
           <div style={{marginBottom:22}}>
             <div style={{...SANS, fontSize:22, fontWeight:700, color:C.text, marginBottom:6, letterSpacing:"-.02em"}}>
-              {currentModel ? currentModel.name : "Upload & Analyze"}
+              {currentModel ? currentModel.name : "Setup"}
             </div>
             <div style={{fontSize:13, color:C.textSub, lineHeight:1.6, maxWidth:680}}>
               Drop any Terraform, HCL, Sentinel, JSON, YAML, docs, or any other file. TF/HCL files are parsed for resources and connections; all other files become context documents that inform the analysis.
@@ -2163,13 +2283,13 @@ export default function App() {
                 </div>
 
                 <div style={{display:"flex", gap:10}}>
-                  <button onClick={()=>setMainTab("analysis")} style={{
+                  <button onClick={()=>setNavSection("threats")} style={{
                     background:"linear-gradient(135deg,#FF6B35,#FF9900)",
                     border:"none", borderRadius:8, padding:"10px 24px",
                     color:"#000", fontWeight:700, fontSize:13, cursor:"pointer", ...SANS,
                     display:"flex", alignItems:"center", gap:8,
                   }}>🔬 View Analysis →</button>
-                  <button onClick={()=>setMainTab("dfd")} style={{
+                  <button onClick={()=>setNavSection("diagram")} style={{
                     background:C.surface2, border:`1px solid ${C.accent}44`,
                     borderRadius:8, padding:"10px 24px",
                     color:C.accent, fontWeight:600, fontSize:13, cursor:"pointer", ...SANS,
@@ -2298,7 +2418,7 @@ export default function App() {
         };
 
         return (
-          <div style={{ height:"calc(100vh - 58px)", overflow:"hidden", display:"flex", flexDirection:"column" }}>
+          <div style={{ height:"100%", overflow:"hidden", display:"flex", flexDirection:"column" }}>
             {/* Header bar */}
             <div style={{ padding:"16px 28px", borderBottom:`1px solid ${C.border}`, background:C.surface,
               display:"flex", alignItems:"center", gap:16, flexShrink:0 }}>
@@ -2326,11 +2446,11 @@ export default function App() {
             {!archAnalysis && !archAnalyzing ? (
               <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", gap:12 }}>
                 <Building2 size={40} style={{color:C.textMuted, opacity:.4}}/>
-                <div style={{...SANS, fontSize:14, color:C.textMuted}}>Upload Terraform files or documents to generate architecture analysis</div>
-                <button onClick={()=>setMainTab("build")} style={{
+                <div style={{...SANS, fontSize:14, color:C.textMuted}}>Upload Terraform files or documents in Setup to generate architecture analysis</div>
+                <button onClick={()=>setNavSection("setup")} style={{
                   ...SANS, fontSize:12, padding:"7px 16px", borderRadius:7,
                   background:`${C.accent}18`, border:`1px solid ${C.accent}44`, color:C.accent, cursor:"pointer",
-                }}>Go to Upload & Analyze</button>
+                }}>Go to Setup</button>
               </div>
             ) : (() => {
               // ── Inline markdown renderer for narrative preview ──
@@ -2632,7 +2752,7 @@ export default function App() {
 
       {/* ── THREATAFORM ANALYSIS TAB ── */}
       {mainTab==="analysis" && (
-        <div style={{flex:1, overflow:"auto", background:C.bg, height:"calc(100vh - 58px)"}}>
+        <div style={{flex:1, overflow:"auto", background:C.bg, height:"100%"}}>
           {parseResult ? (
             <AnalysisErrorBoundary>
               <AnalysisPanel parseResult={parseResult} files={files} userDocs={userDocs} scopeFiles={scopeFiles} onScopeChange={setScopeFiles}/>
@@ -2652,17 +2772,17 @@ export default function App() {
               }}>🔬</div>
               <div>
                 <div style={{fontSize:20, fontWeight:700, color:C.text, textAlign:"center", marginBottom:10}}>
-                  Threataform Analysis
+                  No threats analyzed yet
                 </div>
                 <div style={{fontSize:14, color:C.textSub, textAlign:"center", maxWidth:480, lineHeight:1.75}}>
-                  Upload Terraform files to generate a full architectural analysis — STRIDE-LM threat modeling, MITRE ATT&CK® mapping, security findings, trust boundaries, and architecture narrative.
+                  Upload Terraform files in Setup to begin — STRIDE-LM threat modeling, MITRE ATT&CK® mapping, security findings, trust boundaries, and architecture narrative.
                 </div>
               </div>
-              <button onClick={()=>setMainTab("build")} style={{
+              <button onClick={()=>setNavSection("setup")} style={{
                 background:"linear-gradient(135deg,#FF6B35,#FF9900)",
                 border:"none", borderRadius:8, padding:"12px 28px",
                 color:"#000", fontWeight:700, fontSize:14, cursor:"pointer", ...SANS,
-              }}>Upload .tf Files →</button>
+              }}>Go to Setup →</button>
             </div>
           )}
         </div>
@@ -2670,7 +2790,7 @@ export default function App() {
 
       {/* ── DFD OUTPUT TAB ── */}
       {mainTab==="dfd" && (
-        <div style={{display:"flex", flexDirection:"column", height:"calc(100vh - 58px)"}}>
+        <div style={{display:"flex", flexDirection:"column", height:"100%"}}>
           {/* Sub-tab bar */}
           <div style={{
             background:C.surface, borderBottom:`1px solid ${C.border}`,
@@ -2702,7 +2822,7 @@ export default function App() {
             })}
             {!xml && !parseResult && (
               <span style={{fontSize:12, color:C.textMuted, marginLeft:16}}>
-                ← Upload files in the "Upload & Analyze" tab first
+                ← Drop .tf files in Setup to generate your DFD
               </span>
             )}
           </div>
@@ -3013,13 +3133,13 @@ export default function App() {
             {dfdTab==="stats" && !parseResult && (
               <div style={{height:"100%", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:14, opacity:0.3, padding:40}}>
                 <div style={{fontSize:48}}>🗺</div>
-                <div style={{fontSize:14, letterSpacing:".1em", textAlign:"center"}}>Upload .tf files to generate<br/>your enterprise DFD</div>
-                <button onClick={()=>setMainTab("build")} style={{background:"none",border:"1px solid #333",borderRadius:4,padding:"6px 16px",color:"#555",fontSize:11,cursor:"pointer"}}>Go to Upload →</button>
+                <div style={{fontSize:14, letterSpacing:".1em", textAlign:"center"}}>No diagram yet. Drop your .tf files in Setup<br/>to auto-generate your architecture DFD.</div>
+                <button onClick={()=>setNavSection("setup")} style={{background:"none",border:"1px solid #333",borderRadius:4,padding:"6px 16px",color:"#555",fontSize:11,cursor:"pointer"}}>Go to Setup →</button>
               </div>
             )}
           </div>
         </div>
       )}
-    </div>
+    </WorkspaceShell>
   );
 }
